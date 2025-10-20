@@ -165,6 +165,8 @@ def get_dmc(
         xarray, timestep=timestep, start=start_time, end=end_time
     )
 
+    translator.xarray_to_netcdf(xarray)
+
     return xarray
 
 
