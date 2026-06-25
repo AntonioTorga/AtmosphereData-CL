@@ -418,8 +418,8 @@ class Translator:
 
             data_dd.append(_ddf)
             site_id_dim.append(site_id)
-            lat_dim.append(lat)
-            lon_dim.append(lon)
+            lat_dim.append(float(lat))
+            lon_dim.append(float(lon))
 
             for attribute in location_attr_dims.keys():
                 x = id_row[[attribute]].iloc[0][attribute]
