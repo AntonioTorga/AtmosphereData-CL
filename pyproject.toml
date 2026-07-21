@@ -22,7 +22,12 @@ dependencies = [
         "python-dateutil",
         "typing_extensions",
         "rich",
+        "beautifulsoup4",
+        "lxml",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest"]
 
 [project.scripts]
 AtmosphereData-CL = "atmosphere_data_cl.cli:app"

@@ -154,7 +154,13 @@ Read this before picking up any task here.
 
 1. ~~**Rename + packaging fix.**~~ Done — tree moved to `src/atmosphere_data_cl/`,
    `[tool.setuptools]` added, entrypoint and deps fixed. `pip install -e .` works.
-2. **`REF_ONLY/` reference implementations land**; user provides the DMC-WEB scraper and its
+2. ~~**Source layer + 3 sources.**~~ Done — `sources/` with declarative fan-out, registry,
+   shared driver (retries + skip-if-cached); `sinca`, `vipnet`, `dmc-api` ported. `store/`
+   has `OneCsvPerStation` and `SingleNetcdf`. 81 tests, all offline.
+3. **Store layer proper** — `_split` for arbitrary path templates, `_merge_existing` for
+   incremental cron appends, partitioned master directories, parquet/zarr encoders. Then
+   retire `data_download/` and `translate/`.
+4. **`REF_ONLY/` remaining work**; user provides the DMC-WEB scraper and its
    URL. The Source abstraction should be shaped by these real implementations rather than
    guessed at ahead of them.
 3. **Build the Source registry and Store abstraction**, starting with `dmc-api`.
