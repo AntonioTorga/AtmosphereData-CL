@@ -29,8 +29,8 @@ class Timestep(StrEnum):
 
 
 app = typer.Typer(
-    name="MonetioCL",
-    help="Monetio Command Line Interface",
+    name="AtmosphereData-CL",
+    help="AtmosphereData-CL Command Line Interface",
     pretty_exceptions_enable=False,
 )
 
