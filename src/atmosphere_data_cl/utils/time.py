@@ -15,8 +15,32 @@ from dateutil import parser
 
 log = logging.getLogger(__name__)
 
-# Accepts "date - date" or "date to date"; each date is in dayfirst format.
-TIME_INTERVAL_FORMAT = r"^(.+?)\s*(?:-|to)\s*(.+)$"
+def _parses_as_single(token: str) -> bool:
+    try:
+        parser.parse(token, dayfirst=True)
+        return True
+    except (ValueError, OverflowError):
+        return False
+
+
+def _split_interval(time_interval: str) -> tuple[str, str]:
+    """Split ``"start - end"`` / ``"start to end"`` into endpoints, or a single
+    date to itself.
+
+    A bare hyphen is ambiguous — ISO dates contain them (``"2026-07-20"``) — so it
+    is only treated as a range separator when the whole string does *not* parse as
+    a single date. An explicit ``to`` or a spaced `` - `` is always a range.
+    """
+    if (m := re.match(r"^(.+?)\s+to\s+(.+)$", time_interval, re.IGNORECASE)):
+        return m.group(1), m.group(2)
+    if (m := re.match(r"^(.+?)\s+-\s+(.+)$", time_interval)):
+        return m.group(1), m.group(2)
+    if _parses_as_single(time_interval):
+        return time_interval, time_interval
+    if "-" in time_interval:
+        head, tail = time_interval.split("-", 1)
+        return head.strip(), tail.strip()
+    return time_interval, time_interval
 
 # Coarsest-to-finest. Only resolutions coarser than "hour" expand to a full bucket.
 _RESOLUTION_ORDER = ("year", "month", "day", "hour", "minute", "second")
@@ -72,12 +96,7 @@ def manage_time_interval(time_interval: str | None) -> tuple[pd.Timestamp | None
         return None, None
     time_interval = time_interval.strip()
 
-    # A separator splits a range; otherwise the whole string is a single date
-    # that spans its own bucket (start_str == end_str).
-    if (match := re.match(TIME_INTERVAL_FORMAT, time_interval)) is not None:
-        start_str, end_str = match.group(1), match.group(2)
-    else:
-        start_str = end_str = time_interval
+    start_str, end_str = _split_interval(time_interval)
 
     start_val, start_res = _parse_with_resolution(start_str)
     end_val, end_res = _parse_with_resolution(end_str)
@@ -129,13 +148,35 @@ _CHUNK_FREQ = {
 }
 
 
+_CHUNK_OFFSET = {
+    "hour": pd.Timedelta(hours=1),
+    "day": pd.Timedelta(days=1),
+    "month": pd.DateOffset(months=1),
+    "year": pd.DateOffset(years=1),
+}
+
+
+def _floor_to_grain(ts: pd.Timestamp, grain: str) -> pd.Timestamp:
+    """Floor ``ts`` to the start of the bucket of ``grain`` that contains it."""
+    if grain == "hour":
+        return ts.floor("h")
+    if grain == "day":
+        return ts.floor("D")
+    if grain == "month":
+        return ts.replace(day=1, hour=0, minute=0, second=0, microsecond=0, nanosecond=0)
+    if grain == "year":
+        return ts.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0, nanosecond=0)
+    raise ValueError(f"Unknown chunk grain {grain!r}; expected one of {sorted(_CHUNK_FREQ)}")
+
+
 def chunk_period(start: pd.Timestamp, end: pd.Timestamp, grain: str | None) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
     """Split ``[start, end]`` into consecutive buckets of ``grain``.
 
     ``grain=None`` means the range is not chunked at all — one bucket covering
     everything, which is what a source that accepts a from/to range wants.
     Buckets are inclusive of ``end`` and clipped to the requested range, so the
-    first and last bucket may be partial.
+    first and last bucket may be partial. A single instant (``start == end``)
+    yields exactly one bucket.
     """
     if grain is None:
         return [(start, end)]
@@ -143,20 +184,19 @@ def chunk_period(start: pd.Timestamp, end: pd.Timestamp, grain: str | None) -> l
         raise ValueError(f"Unknown chunk grain {grain!r}; expected one of {sorted(_CHUNK_FREQ)}")
 
     freq = _CHUNK_FREQ[grain]
-    # `normalize`-style flooring: start the first bucket at the boundary that
-    # contains `start`, so a mid-month start still yields whole-month buckets.
-    starts = pd.date_range(start=start.floor("D") if grain in ("hour", "day") else start,
-                           end=end, freq=freq)
-    if len(starts) == 0 or starts[0] > start:
-        starts = pd.DatetimeIndex([start]).append(starts)
-
-    offset = {"hour": pd.Timedelta(hours=1), "day": pd.Timedelta(days=1),
-              "month": pd.DateOffset(months=1), "year": pd.DateOffset(years=1)}[grain]
+    offset = _CHUNK_OFFSET[grain]
+    # Walk bucket starts from the boundary containing `start` — flooring to the
+    # grain's *own* boundary (not the day), so a mid-bucket start still yields
+    # whole buckets without emitting spurious pre-start ones.
+    starts = pd.date_range(start=_floor_to_grain(start, grain), end=end, freq=freq)
+    if len(starts) == 0:
+        starts = pd.DatetimeIndex([_floor_to_grain(start, grain)])
 
     buckets = []
     for bucket_start in starts:
-        bucket_end = min(bucket_start + offset - pd.Timedelta(1, "ns"), end)
-        if bucket_start > end:
-            break
-        buckets.append((max(bucket_start, start), bucket_end))
+        lo = max(bucket_start, start)
+        hi = min(bucket_start + offset - pd.Timedelta(1, "ns"), end)
+        if lo > hi:
+            continue  # bucket lies entirely outside [start, end]
+        buckets.append((lo, hi))
     return buckets

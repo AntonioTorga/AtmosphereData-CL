@@ -94,3 +94,29 @@ class TestChunking:
         start, end = manage_time_interval("9/2022")
         with pytest.raises(ValueError, match="Unknown chunk grain"):
             chunk_period(start, end, "fortnight")
+
+    def test_iso_date_is_not_split_on_its_hyphens(self):
+        """Regression: '2026-07-20 12:00' was split on the first '-' into
+        ('2026', '07-20 12:00'). An ISO date is one instant, not a range."""
+        start, end = manage_time_interval("2026-07-20 12:00")
+        assert start == pd.Timestamp("2026-07-20 12:00")
+        assert end == pd.Timestamp("2026-07-20 12:00")
+
+    def test_iso_range_with_to(self):
+        start, end = manage_time_interval("2026-07-20 to 2026-07-25")
+        assert start == pd.Timestamp("2026-07-20")
+        assert end == pd.Timestamp("2026-07-25 23:59:59.999999999")
+
+    def test_single_instant_is_one_bucket(self):
+        """A mid-bucket instant must yield exactly one bucket, not one per hour
+        since midnight. Regression: day-flooring used to emit inverted buckets."""
+        start, end = manage_time_interval("9/9/2022 14:00")
+        buckets = chunk_period(start, end, "hour")
+        assert len(buckets) == 1
+        assert buckets[0] == (pd.Timestamp("2022-09-09 14:00"), pd.Timestamp("2022-09-09 14:00"))
+
+    def test_mid_bucket_start_has_no_inverted_buckets(self):
+        start, end = manage_time_interval("9/9/2022 14:30 to 9/9/2022 17:00")
+        buckets = chunk_period(start, end, "hour")
+        assert all(lo <= hi for lo, hi in buckets)  # never start-after-end
+        assert buckets[0][0] == start  # first bucket clipped to the request

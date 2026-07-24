@@ -2,3 +2,6 @@
 /venv/
 *.egg-info/
 /REF_ONLY/
+.env
+/scratch_output/
+/raw_ato_by_hand/

@@ -38,5 +38,10 @@ where = ["src"]
 [tool.setuptools.package-data]
 atmosphere_data_cl = ["config/*.json"]
 
+[tool.pytest.ini_options]
+# Only our own tests. REF_ONLY vendors reference repos that carry their own
+# suites and dependencies (openpyxl, etc.) — those are not part of this project.
+testpaths = ["tests"]
+
 [tool.black]
 line-length = 88

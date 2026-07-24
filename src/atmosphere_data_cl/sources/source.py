@@ -107,6 +107,16 @@ class Source:
     time_grain: str | None = None
     #: Native payload format, as emitted by ``fetch`` when no format is asked for.
     native_format: str = "json"
+    #: Maps normalized metadata names -> this source's discovery column names, so
+    #: station lat/lon/name/... travel with the data as coordinates. Only columns
+    #: actually present in the discovery table are used, so speculative entries
+    #: are harmless. Empty means the source carries no station metadata.
+    station_meta_map: dict[str, str] = {}
+    #: Directory+filename template for one raw file, relative to ``raw_dir``. The
+    #: per-file axes live *in the path* (``{variable}/{station}/{start}-{end}``),
+    #: so ``RawStore`` can recover them with ``parse_template`` — no sidecars, no
+    #: manifest. Fields are supplied by ``_identity``.
+    raw_template: str = "{key}.{ext}"
 
     max_retries: int = 3
     backoff_seconds: float = 1.0
@@ -141,12 +151,77 @@ class Source:
         """Build the HTTP request for one job."""
 
     @abstractmethod
-    def _parse(self, payload: Any, job: Job) -> pd.DataFrame:
-        """Parse one response into a long DataFrame."""
+    def _identity(self, job: Job) -> dict[str, str]:
+        """The per-file axes as a flat dict of path-safe strings.
+
+        These fields fill ``raw_template`` to place the raw file, and are exactly
+        the context ``_parse`` needs — so a file's identity travels in its path
+        and nowhere else. Values must be filesystem-safe (ids/codes/timestamps,
+        never display names).
+        """
+
+    @abstractmethod
+    def _parse(self, payload: Any, ctx: dict[str, str]) -> pd.DataFrame:
+        """Parse one response into a long ``[timestamp, station, variable, value, unit]``.
+
+        ``ctx`` is the identity dict (from ``_identity`` live, or recovered from
+        the path by ``RawStore`` on disk), plus any read-time options. Parsing
+        thus works identically whether the payload just arrived or was picked up
+        off disk with no live fetch.
+        """
 
     def discover_stations(self) -> pd.DataFrame:
         """Return station metadata. Required for ``discovery == "required"``."""
         raise NotImplementedError(f"{self.name} does not implement station discovery")
+
+    def _cached_stations(self) -> pd.DataFrame | None:
+        """The discovery table if already available *without* a network call.
+
+        Uses an in-memory ``_stations`` if the source keeps one, else a
+        ``stations_file`` already on disk. Never fetches — a disk-only
+        ``RawStore.read`` must stay offline.
+        """
+        if getattr(self, "_stations", None) is not None:
+            return self._stations
+        stations_file = getattr(self, "stations_file", None)
+        if stations_file is not None and Path(stations_file).exists():
+            return pd.read_csv(stations_file)
+        return None
+
+    def station_metadata(self) -> pd.DataFrame:
+        """Normalized station metadata: a ``station`` column plus lat/lon/name/...
+
+        Keyed by the same id the value frames use, so it attaches as coordinates.
+        Offline — cached discovery only, so metadata is threaded when available
+        and simply absent otherwise.
+        """
+        empty = pd.DataFrame(columns=["station"])
+        if not self.station_meta_map:
+            return empty
+        raw = self._cached_stations()
+        if raw is None or raw.empty:
+            return empty
+        rename = {src: norm for norm, src in self.station_meta_map.items() if src in raw.columns}
+        meta = raw[list(rename)].rename(columns=rename)
+        if "station" not in meta.columns:
+            return empty
+        meta["station"] = meta["station"].astype(str)
+        # Sources return coordinates as strings ("-18.35555"); make them numeric
+        # so they land as float coords rather than string ones.
+        for col in ("latitude", "longitude", "altitude"):
+            if col in meta.columns:
+                meta[col] = pd.to_numeric(meta[col], errors="coerce")
+        return meta.drop_duplicates("station")
+
+    def _accumulate_discovery(self, items: list[tuple[Job, Any]]) -> None:
+        """Harvest station metadata from a whole fetch's payloads, once.
+
+        Only meaningful for ``discovery == "derived"`` sources (Vipnet), where
+        the station set rides along in every response. Called once per fetch with
+        every (job, payload) pair, so the ``stations`` union is written a single
+        time rather than rebuilt on every request. Default: no-op.
+        """
+        return None
 
     # --------------------------------------------------------------- driver
 
@@ -196,7 +271,10 @@ class Source:
         self.close()
 
     def _raw_path(self, job: Job) -> Path:
-        return self.raw_dir / f"{job.key}.{self.native_format}"
+        from ..utils.paths import render_template
+
+        fields = {**self._identity(job), "ext": self.native_format}
+        return self.raw_dir / render_template(self.raw_template, fields)
 
     def _execute(self, job: Job, use_cache: bool = True) -> Any:
         """Run one job, returning its payload. Cached payloads short-circuit."""
@@ -258,19 +336,28 @@ class Source:
         stations: list[str] | None = None,
         variables: list[str] | None = None,
         format: type | None = None,
+        dest: str | Path | None = None,
         use_cache: bool = True,
         **extras,
     ):
-        """Fetch data, returning it in the source's native form.
+        """Acquire data, returning a ``RawStore`` bound to this source.
 
-        Pass a layout class as ``format`` to convert on the way out::
+        Every job's payload lands in the raw store as downloaded (the store *is*
+        the cache — a period already on disk is never refetched). The return
+        value is a ``RawStore`` handle over that directory, which you can read
+        lazily or convert::
 
-            Sinca().fetch("O3", "9/2022")
-            Sinca().fetch("O3", "9/2022", format=OneCsvPerStation)
+            raw = Sinca().fetch("O3", "9/2022")          # RawStore, nothing parsed
+            raw.read()                                   # → (time, station) Dataset
+            Store.change_format(raw, OneCsvPerStation("out"))
 
-        Raw payloads always land in the raw store regardless, so the store
-        doubles as the cache: a period already on disk is never refetched.
+        Passing ``format`` (a Store class) plus ``dest`` converts immediately and
+        returns the written paths — sugar over ``change_format``. Parsing only
+        ever happens on a read/convert, never on acquisition.
         """
+        from ..store.raw import RawStore
+        from ..store.store import Store
+
         start, end = as_interval(period)
         spec = FetchSpec(
             product=product, start=start, end=end,
@@ -280,26 +367,25 @@ class Source:
         if self.discovery == "required":
             self.discover_stations()
 
-        frames = []
+        derived_items: list[tuple[Job, Any]] = []
         for job in self.plan(spec):
             try:
                 payload = self._execute(job, use_cache=use_cache)
             except Exception as exc:  # one bad job must not lose the whole run
-                log.warning("%s: job %s failed permanently: %s", self.name, job.key, exc)
+                log.warning(f"{self.name}: job {job.key} failed permanently: {exc}")
                 continue
-            parsed = self._parse(payload, job)
-            if parsed is not None and not parsed.empty:
-                frames.append(parsed)
+            if self.discovery == "derived":
+                derived_items.append((job, payload))
 
-        data = (
-            pd.concat(frames, ignore_index=True)
-            if frames
-            else pd.DataFrame(columns=["timestamp", "station", "variable", "value"])
-        )
+        # Derived discovery: union the station metadata once, not per request.
+        if derived_items:
+            self._accumulate_discovery(derived_items)
 
+        raw = RawStore(self, read_options={"stations": stations, **extras})
         if format is None:
-            return data
-        return format.write_from_long(data, source=self, spec=spec)
+            return raw
+        target = format(dest if dest is not None else self.raw_dir.parent / format.name)
+        return Store.change_format(raw, target)
 
 
 def _product(axes: dict[str, list[Any]]) -> Iterator[dict[str, Any]]:

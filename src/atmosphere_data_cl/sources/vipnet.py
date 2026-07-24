@@ -10,9 +10,7 @@ returns every station in the country, but covers only a single instant — so
 stations *collapse* and time *fans out* hourly.
 """
 
-import json
 import logging
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -43,6 +41,10 @@ DEFAULT_MODE = "Acumulado"
 ACCUM_RANGE_HOURS = 1
 
 STATION_META_COLS = ["codigo", "region", "estacion", "altitud", "latitud", "longitud"]
+
+# The path carries the safe (accent-stripped) variable name; recover the real
+# one for unit lookup. safe_name is lossy, so we invert it with a known table.
+_SAFE_TO_VAR = {safe_name(v): v for v in VARIABLES}
 
 
 def parse_api_records(records: list[dict], variable: str, unit: str = "") -> pd.DataFrame:
@@ -86,6 +88,12 @@ class Vipnet(Source):
     #: One request covers one instant, so a range fans out into hourly jobs.
     time_grain = "hour"
     native_format = "json"
+    #: raw/vipnet/<variable>/<YYYYMMDDTHHMM>.json — variable + instant in the path.
+    raw_template = "{variable}/{time}.{ext}"
+    station_meta_map = {
+        "station": "codigo", "name": "estacion", "region": "region",
+        "latitude": "latitud", "longitude": "longitud", "altitude": "altitud",
+    }
 
     def __init__(self, *args, mode: str = DEFAULT_MODE, **kwargs):
         super().__init__(*args, **kwargs)
@@ -93,6 +101,12 @@ class Vipnet(Source):
             raise ValueError(f"Unknown mode {mode!r}. Valid: {sorted(MAP_STATISTIC)}")
         self.mode = mode
         self.stations_file = self.raw_dir / "stations.csv"
+
+    def _identity(self, job: Job) -> dict[str, str]:
+        return {
+            "variable": safe_name(job.axes["variable"]),
+            "time": job.start.strftime("%Y%m%dT%H%M"),
+        }
 
     def _plan_axes(self, spec: FetchSpec) -> dict[str, list[Any]]:
         """Fan out over variables; stations collapse (every request is network-wide)."""
@@ -119,44 +133,40 @@ class Vipnet(Source):
             timeout=30.0,
         )
 
-    def _save_raw(self, payload: Any, path: Path) -> None:
-        # Keep the self-describing envelope: the request params travel with the
-        # response so a raw file is interpretable without its filename.
-        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    def _accumulate_discovery(self, items: list[tuple[Job, dict]]) -> None:
+        """Derived discovery: union every payload's station metadata, once.
 
-    def _execute(self, job: Job, use_cache: bool = True):
-        payload = super()._execute(job, use_cache=use_cache)
-        # Wrap on first fetch; cached files are already wrapped.
-        if isinstance(payload, dict) and "variable" not in payload:
+        The raw JSON is now stored as-downloaded (no envelope), so the variable
+        comes from the job, not the payload. Called a single time per fetch.
+        """
+        frames = []
+        for job, payload in items:
             variable = job.axes["variable"]
-            wrapped = {
-                "variable": variable,
-                "unit": VARIABLES[variable]["unit"],
-                "data": payload.get("data", []),
-            }
-            self._save_raw(wrapped, self._raw_path(job))
-            return wrapped
-        return payload
+            unit = VARIABLES.get(variable, {}).get("unit", "")
+            long = parse_api_records((payload or {}).get("data", []), variable, unit)
+            if not long.empty:
+                frames.append(long[STATION_META_COLS])
+        if frames:
+            self._upsert_stations(pd.concat(frames, ignore_index=True))
 
-    def _parse(self, payload: dict, job: Job) -> pd.DataFrame:
-        variable = payload.get("variable", job.axes["variable"])
-        unit = payload.get("unit", VARIABLES.get(variable, {}).get("unit", ""))
-        long = parse_api_records(payload.get("data", []), variable, unit)
+    def _parse(self, payload: dict, ctx: dict[str, str]) -> pd.DataFrame:
+        variable = _SAFE_TO_VAR.get(ctx["variable"], ctx["variable"])
+        unit = VARIABLES.get(variable, {}).get("unit", "")
+        long = parse_api_records((payload or {}).get("data", []), variable, unit)
         if long.empty:
             return long
 
-        self._upsert_stations(long)
-
         out = pd.DataFrame({
-            "timestamp": job.start,
+            "timestamp": pd.to_datetime(ctx["time"], format="%Y%m%dT%H%M"),
             "station": long["codigo"],
             "variable": long["variable"],
             "value": long["valor"],
             "unit": long["unidad"],
         })
-        if job.spec.stations:
+        wanted = ctx.get("stations")
+        if wanted:
             # VipNet cannot filter server-side, so station selection is post-hoc.
-            out = out[out["station"].isin({str(s) for s in job.spec.stations})]
+            out = out[out["station"].isin({str(s) for s in wanted})]
         return out
 
     def _upsert_stations(self, long: pd.DataFrame) -> None:

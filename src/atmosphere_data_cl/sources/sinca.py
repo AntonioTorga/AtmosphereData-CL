@@ -180,6 +180,15 @@ class Sinca(Source):
     #: SINCA accepts an arbitrary from/to range, so time never fans out.
     time_grain = None
     native_format = "csv"
+    #: raw/sinca/<variable>/<station>__<height>__<from>-<to>.csv — split by
+    #: variable (one folder), with station and height as filename prefixes.
+    #: Height is really a distinct variable (TEMP@2m != TEMP@10m), so it earns no
+    #: folder of its own. Pollutants use height "na".
+    raw_template = "{variable}/{station}__{height}__{start}-{end}.{ext}"
+    station_meta_map = {
+        "station": "station_id", "name": "name", "region": "region",
+        "latitude": "latitude", "longitude": "longitude",
+    }
 
     def __init__(self, *args, stations_file: str | Path | None = None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -218,19 +227,29 @@ class Sinca(Source):
         for region in regions or REGIONES:
             html = self.client.get(REGION_URL.format(region=region), timeout=30).text
             soup = BeautifulSoup(html, "lxml")
-            table = soup.select_one("#tablaRegional")
-            if table is None:
+            table = soup.find("table", id="tablaRegional")
+            if table is None or table.tbody is None:
                 log.warning("sinca: no station table for region %s", region)
                 continue
-            for link in table.select("a[href]"):
-                match = _AIRVIRO_RE.search(link["href"])
-                if not match:
+            # One station per tbody row: the station link lives in the row's <th>,
+            # and the airviro_id (routing key) is hidden in one of the row's data
+            # links as `macropath=./R<region>/<AIRVIRO>/...`. Scanning *every* link
+            # instead (the earlier bug) picked up macro data links as stations.
+            for tr in table.tbody.find_all("tr"):
+                anchor = tr.th.find("a", href=True) if tr.th else None
+                if anchor is None:
                     continue
+                airviro = None
+                for link in tr.find_all("a", href=True):
+                    match = _AIRVIRO_RE.search(link["href"])
+                    if match:
+                        airviro = match.group(1)
+                        break
                 rows.append({
-                    "station_id": link["href"].rstrip("/").split("/")[-1],
-                    "name": link.get_text(strip=True),
+                    "station_id": anchor["href"].rstrip("/").rsplit("/", 1)[-1],
+                    "name": anchor.get_text(strip=True),
                     "region": region,
-                    "airviro_id": match.group(1),
+                    "airviro_id": airviro,
                 })
 
         stations = pd.DataFrame(rows, columns=STATION_META_COLS)
@@ -319,6 +338,17 @@ class Sinca(Source):
             },
         )
 
+    def _identity(self, job: Job) -> dict[str, str]:
+        station = job.axes["station"]
+        spec = job.axes["job"]
+        return {
+            "variable": spec["variable"],
+            "station": str(station["station_id"]),
+            "height": spec["height"] or "na",
+            "start": job.start.strftime("%Y%m%d"),
+            "end": job.end.strftime("%Y%m%d"),
+        }
+
     def _decode(self, response: httpx.Response) -> str:
         return response.text
 
@@ -328,16 +358,15 @@ class Sinca(Source):
     def _load_raw(self, path: Path) -> str:
         return path.read_text(encoding="utf-8")
 
-    def _parse(self, payload: str, job: Job) -> pd.DataFrame:
-        station = job.axes["station"]
-        variable = job.axes["job"]["variable"]
-        height = job.axes["job"]["height"]
+    def _parse(self, payload: str, ctx: dict[str, str]) -> pd.DataFrame:
+        variable = ctx["variable"]
+        height = None if ctx.get("height") in (None, "na") else ctx["height"]
         variable_type = self.get_type(variable)
 
         series = parse_sinca_response(
             payload,
             variable_type,
-            job.spec.extras.get("min_validation_level", "validado"),
+            ctx.get("min_validation_level", "validado"),
         )
         if not series:
             return pd.DataFrame()
@@ -348,7 +377,7 @@ class Sinca(Source):
 
         return pd.DataFrame({
             "timestamp": pd.to_datetime(list(series)),
-            "station": str(station["station_id"]),
+            "station": str(ctx["station"]),
             "variable": label,
             "value": pd.to_numeric(list(series.values()), errors="coerce"),
             "unit": UNITS.get(variable, ""),

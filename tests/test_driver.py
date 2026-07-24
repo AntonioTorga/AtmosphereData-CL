@@ -66,8 +66,9 @@ class TestCaching:
     def test_cached_payload_parses_identically(self, tmp_path):
         source = make_source(tmp_path, lambda request: httpx.Response(200, json=BODY))
         job = source.plan(one_hour_spec())[0]
-        fresh = source._parse(source._execute(job), job)
-        cached = source._parse(source._execute(job), job)
+        ctx = source._identity(job)
+        fresh = source._parse(source._execute(job), ctx)
+        cached = source._parse(source._execute(job), ctx)
         pd.testing.assert_frame_equal(fresh, cached)
 
 
@@ -113,16 +114,35 @@ class TestRetries:
 
         source = make_source(tmp_path, handler)
         source.backoff_seconds = 0
-        data = source.fetch("Temperatura", "9/9/2022", variables=["Temperatura"])
-        assert not data.empty
-        assert len(data) == 23  # 24 hours minus the one that failed
+        raw = source.fetch("Temperatura", "9/9/2022", variables=["Temperatura"])
+        # 24 hourly payloads minus the one that failed → 23 files, 23 timestamps.
+        assert raw.read().sizes["time"] == 23
 
 
 class TestFetchShape:
-    def test_returns_long_frame_natively(self, tmp_path):
+    def test_native_fetch_returns_a_readable_raw_store(self, tmp_path):
+        """No format asked for => a RawStore over the payloads as downloaded."""
+        from atmosphere_data_cl.store import RawStore
+
         source = make_source(tmp_path, lambda request: httpx.Response(200, json=BODY))
-        data = source.fetch("Temperatura", "9/9/2022 14:00", variables=["Temperatura"])
-        assert list(data.columns) == ["timestamp", "station", "variable", "value", "unit"]
+        raw = source.fetch("Temperatura", "9/9/2022 14:00", variables=["Temperatura"])
+        assert isinstance(raw, RawStore)
+
+        # The raw json is the response as-downloaded — no wrapping envelope.
+        (path,) = raw.base_dir.glob("*/*.json")
+        assert json.loads(path.read_text())["data"][0]["codigoEstacion"] == "X1"
+
+        # And it reads straight into a canonical (time, station) Dataset.
+        ds = raw.read()
+        assert "temperatura" in ds.data_vars
+        assert list(ds["station"].values) == ["X1"]
+
+    def test_parse_produces_canonical_long_columns(self, tmp_path):
+        """The long frame is the conversion interchange — produced only via _parse."""
+        source = make_source(tmp_path, lambda request: httpx.Response(200, json=BODY))
+        job = source.plan(one_hour_spec())[0]
+        parsed = source._parse(source._execute(job), source._identity(job))
+        assert list(parsed.columns) == ["timestamp", "station", "variable", "value", "unit"]
 
     def test_format_argument_converts_on_the_way_out(self, tmp_path):
         from atmosphere_data_cl.store import OneCsvPerStation
@@ -130,18 +150,58 @@ class TestFetchShape:
         source = make_source(tmp_path, lambda request: httpx.Response(200, json=BODY))
         written = source.fetch(
             "Temperatura", "9/9/2022 14:00",
-            variables=["Temperatura"], format=OneCsvPerStation,
+            variables=["Temperatura"], format=OneCsvPerStation, dest=tmp_path / "out",
         )
-        assert [p.name for p in written] == ["X1.csv"]
+        names = {p.name for p in written}
+        assert names == {"X1.csv", "stations.csv"}  # value file + metadata sidecar
 
     def test_station_filter_is_applied_post_hoc(self, tmp_path):
-        """VipNet cannot filter server-side, so it must filter after parsing."""
+        """VipNet cannot filter server-side, so selection happens on the parse path.
+
+        Native output is unfiltered (raw as downloaded); the filter bites on the
+        conversion path, so a non-matching selection writes nothing.
+        """
+        from atmosphere_data_cl.store import OneCsvPerStation
+
         source = make_source(tmp_path, lambda request: httpx.Response(200, json=BODY))
-        data = source.fetch(
+        written = source.fetch(
             "Temperatura", "9/9/2022 14:00",
             variables=["Temperatura"], stations=["nonexistent"],
+            format=OneCsvPerStation, dest=tmp_path / "out",
         )
-        assert data.empty
+        assert written == []  # filtered out before any file is written
+
+    def test_metadata_rides_along_as_coords(self, tmp_path):
+        """Station lat/lon/name attach to the Dataset as station-dim coordinates."""
+        source = make_source(tmp_path, lambda request: httpx.Response(200, json=BODY))
+        ds = source.fetch("Temperatura", "9/9/2022 14:00", variables=["Temperatura"]).read()
+        assert float(ds["latitude"].sel(station="X1")) == -33.0
+        assert float(ds["longitude"].sel(station="X1")) == -70.0
+        assert str(ds["name"].sel(station="X1").values) == "Uno"
+
+    def test_tabular_writes_metadata_to_a_sidecar(self, tmp_path):
+        """Tabular layouts keep lat/lon out of every value file and in one sidecar,
+        and reattach it on read."""
+        import pandas as pd_
+
+        from atmosphere_data_cl.store import OneCsvPerStation
+
+        source = make_source(tmp_path, lambda request: httpx.Response(200, json=BODY))
+        out = tmp_path / "out"
+        source.fetch("Temperatura", "9/9/2022 14:00", variables=["Temperatura"],
+                     format=OneCsvPerStation, dest=out)
+
+        sidecar = pd_.read_csv(out / "stations.csv")
+        assert list(sidecar["station"].astype(str)) == ["X1"]
+        assert float(sidecar["latitude"].iloc[0]) == -33.0
+
+        # the per-station value file holds only time×variables, no lat/lon columns
+        value = pd_.read_csv(out / "X1.csv")
+        assert "latitude" not in value.columns
+
+        # and reading the store back reattaches the metadata as coords
+        back = OneCsvPerStation(out).read()
+        assert float(back["latitude"].sel(station="X1")) == -33.0
 
     def test_derived_discovery_accumulates_stations(self, tmp_path):
         source = make_source(tmp_path, lambda request: httpx.Response(200, json=BODY))

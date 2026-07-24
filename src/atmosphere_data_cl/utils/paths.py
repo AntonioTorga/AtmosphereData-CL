@@ -77,6 +77,15 @@ def template_fields(template: str) -> list[str]:
     return _FIELD_RE.findall(template)
 
 
+def template_to_glob(template: str) -> str:
+    """Turn a path template into a glob that matches any rendering of it.
+
+    ``"{variable}/{time}.{ext}"`` → ``"*/*.*"``. Used to enumerate every raw
+    file laid out under a template without knowing the field values.
+    """
+    return _FIELD_RE.sub("*", template)
+
+
 def render_template(template: str, values: dict[str, Any]) -> Path:
     """Render a path template like ``{year}/{month}/{day}.parquet``.
 
