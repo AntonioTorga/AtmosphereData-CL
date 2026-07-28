@@ -390,7 +390,7 @@ class Source:
         value is a ``RawStore`` handle over that directory, which you can read
         lazily or convert::
 
-            raw = Sinca().fetch("O3", "9/2022")          # RawStore, nothing parsed
+            raw = Sinca().fetch("O3", "2022-09")         # RawStore, nothing parsed
             raw.read()                                   # → (time, station) Dataset
             Store.change_format(raw, OneCsvPerStation("out"))
 

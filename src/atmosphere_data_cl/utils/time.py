@@ -17,7 +17,7 @@ log = logging.getLogger(__name__)
 
 def _parses_as_single(token: str) -> bool:
     try:
-        parser.parse(token, dayfirst=True)
+        parser.parse(token, yearfirst=True)
         return True
     except (ValueError, OverflowError):
         return False
@@ -54,14 +54,19 @@ COARSE_OFFSETS = {
 def _parse_with_resolution(token: str) -> tuple[pd.Timestamp, str]:
     """Parse a date token and detect the resolution it was written at.
 
-    The trick: parse twice with two wildly different defaults. Any field that
-    comes out equal must have been specified in the token itself, since a
-    default would have produced two different values. So "9/2022" is detected
-    as month-resolution while "9/9/2022" is day-resolution.
+    Dates are read in **descending granularity** (year → month → day), so
+    "2022-09" / "2022/09" is September 2022 and "2022-09-01" / "2022/9/1" is the
+    1st — never day-first. ``yearfirst`` avoids the trap where "2026-07-01" gets
+    read as day 7 of January.
+
+    The trick for resolution: parse twice with two wildly different defaults. Any
+    field that comes out equal must have been specified in the token itself, since
+    a default would have produced two different values. So "2022-09" is detected
+    as month-resolution while "2022-09-09" is day-resolution.
     """
-    floored = parser.parse(token, dayfirst=True, default=datetime.datetime(1999, 1, 1))
+    floored = parser.parse(token, yearfirst=True, default=datetime.datetime(1999, 1, 1))
     probe = parser.parse(
-        token, dayfirst=True, default=datetime.datetime(2002, 7, 8, 9, 10, 11)
+        token, yearfirst=True, default=datetime.datetime(2002, 7, 8, 9, 10, 11)
     )
 
     resolution = "year"
@@ -88,9 +93,11 @@ def _bucket_end(value: pd.Timestamp, resolution: str) -> pd.Timestamp:
 def manage_time_interval(time_interval: str | None) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
     """Turn a time-interval string into ``(start, end)``.
 
-    Accepts either a single date or a "start - end" / "start to end" range. Each
-    endpoint is treated as an interval covering its own resolution when that
-    resolution is coarser than hourly, so ``"9/2022"`` spans all of September.
+    Dates use descending granularity: ``"2022"``, ``"2022-09"``, ``"2022-09-01"``
+    (``-`` or ``/`` separators, single- or double-digit fields). Accepts a single
+    date or a ``"start to end"`` / ``"start - end"`` range. Each endpoint covers
+    its own resolution when coarser than hourly, so ``"2022-09"`` spans all of
+    September.
     """
     if time_interval is None:
         return None, None
@@ -123,7 +130,7 @@ def normalize_time(time: str | list[str] | None) -> list[str | None]:
 def as_interval(period) -> tuple[pd.Timestamp, pd.Timestamp]:
     """Coerce the many things callers pass as a period into ``(start, end)``.
 
-    Accepts an interval string ("9/2022", "1/9/2022 to 30/9/2022"), a
+    Accepts an interval string ("2022-09", "2022-09-01 to 2022-09-30"), a
     ``(start, end)`` pair, or a single datetime-like.
     """
     if isinstance(period, str):

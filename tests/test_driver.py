@@ -22,7 +22,7 @@ BODY = {"data": [
 
 
 def one_hour_spec():
-    start, end = manage_time_interval("9/9/2022 14:00")
+    start, end = manage_time_interval("2022-09-09 14:00")
     return FetchSpec(product="Temperatura", start=start, end=end, variables=["Temperatura"])
 
 
@@ -115,7 +115,7 @@ class TestRetries:
 
         source = make_source(tmp_path, handler)
         source.backoff_seconds = 0
-        raw = source.fetch("Temperatura", "9/9/2022", variables=["Temperatura"])
+        raw = source.fetch("Temperatura", "2022-09-09", variables=["Temperatura"])
         # 24 hourly payloads minus the one that failed → 23 files, 23 timestamps.
         assert raw.read().sizes["time"] == 23
 
@@ -125,7 +125,7 @@ class TestConcurrency:
         """Every one of the 24 hourly jobs still executes under the default pool."""
         source = make_source(tmp_path, lambda request: httpx.Response(200, json=BODY))
         source.concurrency = 8
-        raw = source.fetch("Temperatura", "9/9/2022", variables=["Temperatura"])
+        raw = source.fetch("Temperatura", "2022-09-09", variables=["Temperatura"])
         assert len(list(raw.base_dir.glob("*/*.json"))) == 24
 
     def test_parallel_matches_sequential(self, tmp_path):
@@ -137,8 +137,8 @@ class TestConcurrency:
         par = make_source(tmp_path / "par", handler)
         par.concurrency = 8
 
-        ds_seq = seq.fetch("Temperatura", "9/9/2022", variables=["Temperatura"]).read()
-        ds_par = par.fetch("Temperatura", "9/9/2022", variables=["Temperatura"]).read()
+        ds_seq = seq.fetch("Temperatura", "2022-09-09", variables=["Temperatura"]).read()
+        ds_par = par.fetch("Temperatura", "2022-09-09", variables=["Temperatura"]).read()
 
         assert dict(ds_seq.sizes) == dict(ds_par.sizes)
         xr.testing.assert_equal(ds_seq, ds_par)
@@ -146,7 +146,7 @@ class TestConcurrency:
     def test_one_worker_is_sequential(self, tmp_path):
         source = make_source(tmp_path, lambda request: httpx.Response(200, json=BODY))
         source.concurrency = 1
-        raw = source.fetch("Temperatura", "9/9/2022 14:00", variables=["Temperatura"])
+        raw = source.fetch("Temperatura", "2022-09-09 14:00", variables=["Temperatura"])
         assert "X1" in raw.read()["station"].values
 
 
@@ -156,7 +156,7 @@ class TestFetchShape:
         from atmosphere_data_cl.store import RawStore
 
         source = make_source(tmp_path, lambda request: httpx.Response(200, json=BODY))
-        raw = source.fetch("Temperatura", "9/9/2022 14:00", variables=["Temperatura"])
+        raw = source.fetch("Temperatura", "2022-09-09 14:00", variables=["Temperatura"])
         assert isinstance(raw, RawStore)
 
         # The raw json is the response as-downloaded — no wrapping envelope.
@@ -180,7 +180,7 @@ class TestFetchShape:
 
         source = make_source(tmp_path, lambda request: httpx.Response(200, json=BODY))
         written = source.fetch(
-            "Temperatura", "9/9/2022 14:00",
+            "Temperatura", "2022-09-09 14:00",
             variables=["Temperatura"], format=OneCsvPerStation, dest=tmp_path / "out",
         )
         names = {p.name for p in written}
@@ -196,7 +196,7 @@ class TestFetchShape:
 
         source = make_source(tmp_path, lambda request: httpx.Response(200, json=BODY))
         written = source.fetch(
-            "Temperatura", "9/9/2022 14:00",
+            "Temperatura", "2022-09-09 14:00",
             variables=["Temperatura"], stations=["nonexistent"],
             format=OneCsvPerStation, dest=tmp_path / "out",
         )
@@ -205,7 +205,7 @@ class TestFetchShape:
     def test_metadata_rides_along_as_coords(self, tmp_path):
         """Station lat/lon/name attach to the Dataset as station-dim coordinates."""
         source = make_source(tmp_path, lambda request: httpx.Response(200, json=BODY))
-        ds = source.fetch("Temperatura", "9/9/2022 14:00", variables=["Temperatura"]).read()
+        ds = source.fetch("Temperatura", "2022-09-09 14:00", variables=["Temperatura"]).read()
         assert float(ds["latitude"].sel(station="X1")) == -33.0
         assert float(ds["longitude"].sel(station="X1")) == -70.0
         assert str(ds["name"].sel(station="X1").values) == "Uno"
@@ -219,7 +219,7 @@ class TestFetchShape:
 
         source = make_source(tmp_path, lambda request: httpx.Response(200, json=BODY))
         out = tmp_path / "out"
-        source.fetch("Temperatura", "9/9/2022 14:00", variables=["Temperatura"],
+        source.fetch("Temperatura", "2022-09-09 14:00", variables=["Temperatura"],
                      format=OneCsvPerStation, dest=out)
 
         sidecar = pd_.read_csv(out / "stations.csv")
@@ -236,6 +236,6 @@ class TestFetchShape:
 
     def test_derived_discovery_accumulates_stations(self, tmp_path):
         source = make_source(tmp_path, lambda request: httpx.Response(200, json=BODY))
-        source.fetch("Temperatura", "9/9/2022 14:00", variables=["Temperatura"])
+        source.fetch("Temperatura", "2022-09-09 14:00", variables=["Temperatura"])
         stations = source.discover_stations()
         assert list(stations["codigo"]) == ["X1"]

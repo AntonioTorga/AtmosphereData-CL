@@ -18,7 +18,7 @@ from atmosphere_data_cl.utils.time import manage_time_interval
 _FIELDS = {"product", "stations", "variables"}
 
 
-def spec(period="9/9/2022", **kwargs):
+def spec(period="2022-09-09", **kwargs):
     """Build a FetchSpec, routing source-specific knobs into `extras`."""
     start, end = manage_time_interval(period)
     fields = {k: v for k, v in kwargs.items() if k in _FIELDS}
@@ -140,17 +140,17 @@ class TestVipnetPlan:
 
     def test_a_day_is_144_requests(self, vipnet):
         """6 variables x 24 hours, and no station axis at all."""
-        jobs = vipnet.plan(spec("9/9/2022"))
+        jobs = vipnet.plan(spec("2022-09-09"))
         assert len(jobs) == 144
         assert "station" not in jobs[0].axes
 
     def test_hours_fan_out(self, vipnet):
-        jobs = vipnet.plan(spec("9/9/2022", variables=["Temperatura"]))
+        jobs = vipnet.plan(spec("2022-09-09", variables=["Temperatura"]))
         assert len(jobs) == 24
         assert {j.start.hour for j in jobs} == set(range(24))
 
     def test_request_is_a_post_with_json_body(self, vipnet):
-        job = vipnet.plan(spec("9/9/2022 14:00", variables=["Temperatura"]))[0]
+        job = vipnet.plan(spec("2022-09-09 14:00", variables=["Temperatura"]))[0]
         request = vipnet._build_request(job)
         assert request.method == "POST"
         assert request.json_body["tipoEstacion"] == 1
@@ -159,7 +159,7 @@ class TestVipnetPlan:
 
     def test_mode_is_selectable(self, tmp_path):
         source = Vipnet(raw_dir=tmp_path, mode="Más Actual")
-        job = source.plan(spec("9/9/2022 14:00", variables=["Temperatura"]))[0]
+        job = source.plan(spec("2022-09-09 14:00", variables=["Temperatura"]))[0]
         assert source._build_request(job).json_body["mapStatistic"] == 4
 
     def test_unknown_mode_rejected(self, tmp_path):
@@ -181,7 +181,7 @@ class TestDmcPlan:
         return source
 
     def test_stations_times_months(self, dmc):
-        jobs = dmc.plan(spec("1/1/2022 to 31/3/2022"))
+        jobs = dmc.plan(spec("2022-01-01 to 2022-03-31"))
         assert len(jobs) == 6  # 2 stations x 3 months
 
     def test_request_embeds_year_and_month(self, dmc):
@@ -195,15 +195,15 @@ class TestJobKeys:
     """Job keys are raw-store filenames, so they must be unique and stable."""
 
     def test_keys_are_unique(self, tmp_path):
-        jobs = Vipnet(raw_dir=tmp_path).plan(spec("9/9/2022"))
+        jobs = Vipnet(raw_dir=tmp_path).plan(spec("2022-09-09"))
         assert len({j.key for j in jobs}) == len(jobs)
 
     def test_keys_are_stable_across_planning_runs(self, tmp_path):
         source = Vipnet(raw_dir=tmp_path)
-        first = [j.key for j in source.plan(spec("9/9/2022"))]
-        second = [j.key for j in source.plan(spec("9/9/2022"))]
+        first = [j.key for j in source.plan(spec("2022-09-09"))]
+        second = [j.key for j in source.plan(spec("2022-09-09"))]
         assert first == second
 
     def test_keys_are_filesystem_safe(self, tmp_path):
-        jobs = Vipnet(raw_dir=tmp_path).plan(spec("9/9/2022", variables=["Precipitación"]))
+        jobs = Vipnet(raw_dir=tmp_path).plan(spec("2022-09-09", variables=["Precipitación"]))
         assert all(c.isalnum() or c == "_" for j in jobs for c in j.key)

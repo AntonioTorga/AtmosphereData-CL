@@ -6,7 +6,7 @@ Source it is bound to — each file's axes are recovered from its path (no sidec
 no manifest), and the Source's own ``_parse`` turns the payload into canonical
 records. So the same class serves two flows with no special-casing:
 
-    raw = Vipnet().fetch("Temperatura", "9/9/2022")   # bound to a live source
+    raw = Vipnet().fetch("Temperatura", "2022-09-09")   # bound to a live source
     raw.read()
 
     RawStore(Vipnet, "raw/vipnet").read()             # picked straight off disk,

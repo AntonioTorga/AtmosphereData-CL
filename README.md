@@ -53,8 +53,11 @@ AtmosphereData-CL stores         # formas/formatos de almacenamiento
 AtmosphereData-CL fetch FUENTE PRODUCTO PERIODO [opciones]
 ```
 
-`PERIODO` acepta un instante, un mes o un rango:
-`"2024-01"`, `"2026-07-20 12:00"`, `"1/9/2022 to 30/9/2022"`.
+`PERIODO` usa **granularidad descendente** (año → mes → día), con separadores `-`
+o `/` y campos de uno o dos dígitos. Acepta un año, mes, día o instante, o un
+rango con `to` / ` - `:
+`"2024"`, `"2024-01"`, `"2024-01-15"`, `"2026-07-20 12:00"`,
+`"2024-01-01 to 2024-01-31"`.
 
 Descargar a la *raw store* (que también es la caché — no re-descarga lo ya
 guardado):

@@ -109,7 +109,8 @@ def fetch(
     product: Annotated[str, typer.Argument(
         help="Product/variable, or a comma-separated list: O3 or O3,NO2,PM10.")],
     period: Annotated[str, typer.Argument(
-        help='Interval: "2024-01", "1/9/2022 to 30/9/2022", "2026-07-20 12:00".')],
+        help='Descending-granularity date/interval: "2024", "2024-01", '
+             '"2024-01-15", "2024-01-01 to 2024-01-31", "2026-07-20 12:00".')],
     stations: Annotated[str, typer.Option(help="Comma-separated station ids to keep.")] = None,
     raw_dir: Annotated[str, typer.Option(help="Where raw payloads land (the cache).")] = "raw",
     to: Annotated[str, typer.Option("--to", help="Store to convert into (see `stores`).")] = None,
