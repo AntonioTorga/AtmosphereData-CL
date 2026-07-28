@@ -5,10 +5,12 @@ VipNet decompose the same (station x variable x time) cube in inverted ways.
 Planning is pure and hits no network, so the exact request list is assertable.
 """
 
+import httpx
 import pandas as pd
 import pytest
 
 from atmosphere_data_cl.sources import DmcApi, Sinca, Vipnet, get_source, list_sources
+from atmosphere_data_cl.sources.sinca import STATION_META_COLS
 from atmosphere_data_cl.sources.source import FetchSpec
 from atmosphere_data_cl.utils.time import manage_time_interval
 
@@ -38,6 +40,44 @@ class TestRegistry:
     def test_unknown_name_lists_the_known_ones(self):
         with pytest.raises(KeyError, match="No source registered"):
             get_source("nope")
+
+
+class TestSincaDiscovery:
+    """The scrape+assemble path — bypassed by the planning fixture, so tested here
+    with fake region HTML. (A missing DataFrame build once slipped through because
+    nothing offline drove this code.)"""
+
+    REGION_HTML = (
+        '<table id="tablaRegional"><tbody>'
+        '<tr><th><a href="/index.php/estacion/index/id/232">Arica</a></th>'
+        '<td><a href="?macropath=./RXV/F01/Cal">macro</a></td></tr>'
+        '<tr><th><a href="/index.php/estacion/index/id/157">Alto Hospicio</a></th>'
+        '<td><a href="?macropath=./RI/117/Cal">macro</a></td></tr>'
+        '</tbody></table>'
+    )
+
+    def _source(self, tmp_path):
+        handler = lambda request: httpx.Response(200, text=self.REGION_HTML)  # noqa: E731
+        return Sinca(raw_dir=tmp_path, client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    def test_scrapes_and_assembles_station_table(self, tmp_path):
+        s = self._source(tmp_path)
+        stations = s.discover_stations(regions=["XV", "I"])
+
+        assert list(stations.columns) == STATION_META_COLS
+        assert set(stations["station_id"]) == {"232", "157"}     # from the <th> anchors
+        assert set(stations["airviro_id"]) == {"F01", "117"}     # from the macropath links
+        assert set(stations["region"]) == {"XV", "I"}            # one row per region scanned
+        assert s.stations_file.exists()                          # cached to disk
+
+    def test_concurrency_one_matches_default(self, tmp_path):
+        seq = self._source(tmp_path / "seq")
+        seq.concurrency = 1
+        par = self._source(tmp_path / "par")  # default concurrency
+        pd.testing.assert_frame_equal(
+            seq.discover_stations(regions=["XV", "I", "II"]).sort_values("region").reset_index(drop=True),
+            par.discover_stations(regions=["XV", "I", "II"]).sort_values("region").reset_index(drop=True),
+        )
 
 
 class TestSincaPlan:

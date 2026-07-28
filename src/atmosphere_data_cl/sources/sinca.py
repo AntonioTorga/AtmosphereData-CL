@@ -221,36 +221,10 @@ class Sinca(Source):
             self._stations = pd.read_csv(self.stations_file, dtype={"station_id": str})
             return self._stations
 
-        from bs4 import BeautifulSoup
-
-        rows: list[dict[str, Any]] = []
-        for region in regions or REGIONES:
-            html = self.client.get(REGION_URL.format(region=region), timeout=30).text
-            soup = BeautifulSoup(html, "lxml")
-            table = soup.find("table", id="tablaRegional")
-            if table is None or table.tbody is None:
-                log.warning("sinca: no station table for region %s", region)
-                continue
-            # One station per tbody row: the station link lives in the row's <th>,
-            # and the airviro_id (routing key) is hidden in one of the row's data
-            # links as `macropath=./R<region>/<AIRVIRO>/...`. Scanning *every* link
-            # instead (the earlier bug) picked up macro data links as stations.
-            for tr in table.tbody.find_all("tr"):
-                anchor = tr.th.find("a", href=True) if tr.th else None
-                if anchor is None:
-                    continue
-                airviro = None
-                for link in tr.find_all("a", href=True):
-                    match = _AIRVIRO_RE.search(link["href"])
-                    if match:
-                        airviro = match.group(1)
-                        break
-                rows.append({
-                    "station_id": anchor["href"].rstrip("/").rsplit("/", 1)[-1],
-                    "name": anchor.get_text(strip=True),
-                    "region": region,
-                    "airviro_id": airviro,
-                })
+        # Scrape the 16 regions concurrently — this is the slowest part of a cold
+        # fetch (16 sequential GETs, ~30 s), and it only runs once per cache.
+        per_region = self._map_concurrent(self._scrape_region, list(regions or REGIONES))
+        rows = [row for region_rows in per_region for row in region_rows]
 
         stations = pd.DataFrame(rows, columns=STATION_META_COLS)
         self.stations_file.parent.mkdir(parents=True, exist_ok=True)
@@ -258,6 +232,42 @@ class Sinca(Source):
         self._stations = stations
         log.info("sinca: discovered %d stations", len(stations))
         return stations
+
+    def _scrape_region(self, region: str) -> list[dict[str, Any]]:
+        """Parse one region's listing into station rows.
+
+        One station per tbody row: the station link lives in the row's ``<th>``,
+        and the airviro_id (routing key) is hidden in one of the row's data links
+        as ``macropath=./R<region>/<AIRVIRO>/...``. Scanning *every* link instead
+        (the earlier bug) picked up macro data links as stations.
+        """
+        from bs4 import BeautifulSoup
+
+        html = self.client.get(REGION_URL.format(region=region), timeout=30).text
+        soup = BeautifulSoup(html, "lxml")
+        table = soup.find("table", id="tablaRegional")
+        if table is None or table.tbody is None:
+            log.warning("sinca: no station table for region %s", region)
+            return []
+
+        rows: list[dict[str, Any]] = []
+        for tr in table.tbody.find_all("tr"):
+            anchor = tr.th.find("a", href=True) if tr.th else None
+            if anchor is None:
+                continue
+            airviro = None
+            for link in tr.find_all("a", href=True):
+                match = _AIRVIRO_RE.search(link["href"])
+                if match:
+                    airviro = match.group(1)
+                    break
+            rows.append({
+                "station_id": anchor["href"].rstrip("/").rsplit("/", 1)[-1],
+                "name": anchor.get_text(strip=True),
+                "region": region,
+                "airviro_id": airviro,
+            })
+        return rows
 
     def _targets(self, spec: FetchSpec) -> list[dict[str, Any]]:
         stations = self.discover_stations()

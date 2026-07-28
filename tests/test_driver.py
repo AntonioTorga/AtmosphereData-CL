@@ -9,6 +9,7 @@ import json
 import httpx
 import pandas as pd
 import pytest
+import xarray as xr
 
 from atmosphere_data_cl.sources import Vipnet
 from atmosphere_data_cl.sources.source import FetchSpec
@@ -117,6 +118,36 @@ class TestRetries:
         raw = source.fetch("Temperatura", "9/9/2022", variables=["Temperatura"])
         # 24 hourly payloads minus the one that failed → 23 files, 23 timestamps.
         assert raw.read().sizes["time"] == 23
+
+
+class TestConcurrency:
+    def test_all_jobs_run(self, tmp_path):
+        """Every one of the 24 hourly jobs still executes under the default pool."""
+        source = make_source(tmp_path, lambda request: httpx.Response(200, json=BODY))
+        source.concurrency = 8
+        raw = source.fetch("Temperatura", "9/9/2022", variables=["Temperatura"])
+        assert len(list(raw.base_dir.glob("*/*.json"))) == 24
+
+    def test_parallel_matches_sequential(self, tmp_path):
+        """Concurrency is a dispatch detail: the resulting Dataset is identical."""
+        handler = lambda request: httpx.Response(200, json=BODY)  # noqa: E731
+
+        seq = make_source(tmp_path / "seq", handler)
+        seq.concurrency = 1
+        par = make_source(tmp_path / "par", handler)
+        par.concurrency = 8
+
+        ds_seq = seq.fetch("Temperatura", "9/9/2022", variables=["Temperatura"]).read()
+        ds_par = par.fetch("Temperatura", "9/9/2022", variables=["Temperatura"]).read()
+
+        assert dict(ds_seq.sizes) == dict(ds_par.sizes)
+        xr.testing.assert_equal(ds_seq, ds_par)
+
+    def test_one_worker_is_sequential(self, tmp_path):
+        source = make_source(tmp_path, lambda request: httpx.Response(200, json=BODY))
+        source.concurrency = 1
+        raw = source.fetch("Temperatura", "9/9/2022 14:00", variables=["Temperatura"])
+        assert "X1" in raw.read()["station"].values
 
 
 class TestFetchShape:

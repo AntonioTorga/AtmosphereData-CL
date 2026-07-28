@@ -119,6 +119,8 @@ def fetch(
     user: Annotated[str, typer.Option(help="dmc-api user (else DMC_API_USER).")] = None,
     token: Annotated[str, typer.Option(help="dmc-api token (else DMC_API_TOKEN).")] = None,
     mode: Annotated[str, typer.Option(help="vipnet aggregation mode.")] = None,
+    workers: Annotated[int, typer.Option("--workers",
+        help="Concurrent requests in flight (lower for a rate-limiting endpoint).")] = None,
     extra: Annotated[list[str], typer.Option("--extra",
         help="Extra fetch option key=value (repeatable), e.g. min_validation_level=preliminar.")] = None,
 ):
@@ -132,6 +134,8 @@ def fetch(
         raise typer.BadParameter("--to requires --dest")
 
     src = _build_source(source, raw_dir, user, token, mode)
+    if workers is not None:
+        src.concurrency = workers
     extras = _parse_extras(extra or [])
     # PRODUCT may be a single value or a comma-separated list; either way it drives
     # the source's variable fan-out.

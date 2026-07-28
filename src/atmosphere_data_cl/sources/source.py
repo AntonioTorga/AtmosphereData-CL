@@ -18,12 +18,14 @@ implementation had retries; both get them here for free.
 
 import json
 import logging
+import threading
 import time
 from abc import abstractmethod
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Literal
+from typing import Any, Callable, Iterator, Literal
 
 import httpx
 import pandas as pd
@@ -120,6 +122,10 @@ class Source:
 
     max_retries: int = 3
     backoff_seconds: float = 1.0
+    #: How many requests to run in flight at once. Fetching is almost all network
+    #: wait, so a bounded pool cuts wall time ~linearly. Lower it for a fragile or
+    #: rate-limiting endpoint; 1 means fully sequential.
+    concurrency: int = 8
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -135,6 +141,7 @@ class Source:
         self.raw_dir = Path(raw_dir) / self.name
         self._client = client
         self._owns_client = client is None
+        self._client_lock = threading.Lock()
 
     # ---------------------------------------------------------------- hooks
 
@@ -255,9 +262,28 @@ class Source:
 
     @property
     def client(self) -> httpx.Client:
+        # Double-checked lock: concurrent jobs must not each build their own client.
         if self._client is None:
-            self._client = httpx.Client()
+            with self._client_lock:
+                if self._client is None:
+                    self._client = httpx.Client()
         return self._client
+
+    def _map_concurrent(self, fn: Callable[[Any], Any], items: list) -> list:
+        """Run ``fn`` over ``items`` with a bounded thread pool, preserving order.
+
+        The shared work-horse for parallel I/O — used by the fetch loop and by
+        sources that scrape many pages (SINCA's regions). ``concurrency == 1``
+        stays fully sequential.
+        """
+        items = list(items)
+        if not items:
+            return []
+        if self.concurrency <= 1 or len(items) == 1:
+            return [fn(item) for item in items]
+        self.client  # force one shared client before the workers race for it
+        with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
+            return list(pool.map(fn, items))
 
     def close(self) -> None:
         if self._client is not None and self._owns_client:
@@ -317,6 +343,23 @@ class Source:
                     time.sleep(delay)
         raise last_error
 
+    def _run_jobs(self, jobs: list[Job], use_cache: bool, keep_payloads: bool) -> list[tuple[Job, Any]]:
+        """Execute jobs concurrently, dropping (and logging) any that fail permanently.
+
+        A single bad job never sinks the run. Payloads are retained only when a
+        caller needs them (derived discovery) — otherwise they are written to the
+        raw store and released, so a huge fetch doesn't hold every response in RAM.
+        """
+        def run(job: Job) -> tuple[Job, Any] | None:
+            try:
+                payload = self._execute(job, use_cache=use_cache)
+            except Exception as exc:  # one bad job must not lose the whole run
+                log.warning(f"{self.name}: job {job.key} failed permanently: {exc}")
+                return None
+            return (job, payload if keep_payloads else None)
+
+        return [r for r in self._map_concurrent(run, jobs) if r is not None]
+
     def _decode(self, response: httpx.Response) -> Any:
         """Turn a response into the native payload. Override for text formats."""
         return response.json()
@@ -367,19 +410,14 @@ class Source:
         if self.discovery == "required":
             self.discover_stations()
 
-        derived_items: list[tuple[Job, Any]] = []
-        for job in self.plan(spec):
-            try:
-                payload = self._execute(job, use_cache=use_cache)
-            except Exception as exc:  # one bad job must not lose the whole run
-                log.warning(f"{self.name}: job {job.key} failed permanently: {exc}")
-                continue
-            if self.discovery == "derived":
-                derived_items.append((job, payload))
+        # Run every request concurrently (bounded by `concurrency`). Payloads are
+        # kept only for derived discovery; otherwise they're written and released.
+        keep = self.discovery == "derived"
+        collected = self._run_jobs(self.plan(spec), use_cache, keep_payloads=keep)
 
         # Derived discovery: union the station metadata once, not per request.
-        if derived_items:
-            self._accumulate_discovery(derived_items)
+        if keep and collected:
+            self._accumulate_discovery(collected)
 
         raw = RawStore(self, read_options={"stations": stations, **extras})
         if format is None:
