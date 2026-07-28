@@ -80,9 +80,12 @@ AtmosphereData-CL fetch vipnet Temperatura "2026-07-20 13:00" \
 El `--append` es idempotente (re-ejecutar el mismo periodo no duplica) y atómico
 (un corte a mitad de escritura no corrompe el master).
 
-Opciones útiles: `--stations a,b,c`, `--variables x,y`, `--raw-dir DIR`,
-`--extra clave=valor` (opciones específicas de la fuente, p.ej.
-`--extra min_validation_level=preliminar` en SINCA), `--user`/`--token` (dmc-api).
+`PRODUCTO` acepta una variable o una lista separada por comas (`O3,NO2,PM10`), que
+se descargan en la misma llamada.
+
+Opciones útiles: `--stations a,b,c`, `--raw-dir DIR`, `--extra clave=valor`
+(opciones específicas de la fuente, p.ej. `--extra min_validation_level=preliminar`
+en SINCA), `--user`/`--token` (dmc-api).
 
 ### `convert` — reformatear / reformar un almacén
 

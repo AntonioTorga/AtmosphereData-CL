@@ -106,11 +106,11 @@ def _summarize(ds, label: str) -> None:
 @app.command()
 def fetch(
     source: Annotated[str, typer.Argument(help="Source name (see `sources`).")],
-    product: Annotated[str, typer.Argument(help="Product/variable, e.g. Temperatura, O3.")],
+    product: Annotated[str, typer.Argument(
+        help="Product/variable, or a comma-separated list: O3 or O3,NO2,PM10.")],
     period: Annotated[str, typer.Argument(
         help='Interval: "2024-01", "1/9/2022 to 30/9/2022", "2026-07-20 12:00".')],
     stations: Annotated[str, typer.Option(help="Comma-separated station ids to keep.")] = None,
-    variables: Annotated[str, typer.Option(help="Comma-separated variables.")] = None,
     raw_dir: Annotated[str, typer.Option(help="Where raw payloads land (the cache).")] = "raw",
     to: Annotated[str, typer.Option("--to", help="Store to convert into (see `stores`).")] = None,
     dest: Annotated[str, typer.Option("--dest", help="Destination directory for --to.")] = None,
@@ -133,13 +133,16 @@ def fetch(
 
     src = _build_source(source, raw_dir, user, token, mode)
     extras = _parse_extras(extra or [])
+    # PRODUCT may be a single value or a comma-separated list; either way it drives
+    # the source's variable fan-out.
+    products = _split_csv(product)
     raw = src.fetch(
-        product, period,
+        products[0], period,
         stations=_split_csv(stations),
-        variables=_split_csv(variables),
+        variables=products,
         **extras,
     )
-    print(f"[green]fetched[/green] {source}/{product} → raw under {raw.base_dir}")
+    print(f"[green]fetched[/green] {source}/{','.join(products)} → raw under {raw.base_dir}")
 
     if not to:
         _summarize(raw.read(), "raw")
