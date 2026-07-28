@@ -1,279 +1,189 @@
-from .translate.dmc_translator import DMCTranslator
-from .translate.translator import Translator
-from .data_download.dmc_downloader import DMCDownloader
-from .utils.utils import (
-    check_file,
-    check_path_exists,
-    to_datetime,
-    get_timestamps,
-    get_existing_timestamps,
-)
-from enum import StrEnum
-from datetime import datetime
+"""AtmosphereData-CL command line interface.
+
+Generic verbs over the Source and Store layers: any registered source or store
+works without a new command. Downloading, converting between formats/shapes, and
+growing masters over time are all reachable here.
+"""
+
+import os
+from pathlib import Path
 
 import typer
-from typing_extensions import Annotated
-from pathlib import Path
 from rich import print
+from typing_extensions import Annotated
 
-
-class Timestep(StrEnum):
-    """Enum for the timestep options."""
-
-    H = "H"  # Hourly
-    h = "h"  # hourly
-    D = "D"  # Daily
-    M = "M"  # Monthly
-    Y = "Y"  # Yearly
-    N = "N"
-
+from .sources import get_source, list_sources
+from .store import RawStore, Store
 
 app = typer.Typer(
     name="AtmosphereData-CL",
-    help="AtmosphereData-CL Command Line Interface",
+    help="Download atmospheric data products and reshape them between formats and layouts.",
     pretty_exceptions_enable=False,
+    add_completion=False,
 )
 
 
+# --------------------------------------------------------------------- helpers
+
+def _load_dotenv(path: str = ".env") -> None:
+    """Load KEY=VALUE lines from a .env file into the environment (no override).
+
+    Tiny on purpose — avoids a python-dotenv dependency for the one thing we need
+    it for (DMC credentials).
+    """
+    env_path = Path(path)
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+def _split_csv(value: str | None) -> list[str] | None:
+    """Turn a comma-separated option into a list, or None if unset."""
+    if not value:
+        return None
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _parse_extras(pairs: list[str]) -> dict[str, str]:
+    extras: dict[str, str] = {}
+    for pair in pairs:
+        if "=" not in pair:
+            raise typer.BadParameter(f"--extra expects key=value, got {pair!r}")
+        key, value = pair.split("=", 1)
+        extras[key.strip()] = value.strip()
+    return extras
+
+
+def _build_source(name: str, raw_dir: str, user: str | None, token: str | None, mode: str | None):
+    try:
+        cls = get_source(name)
+    except KeyError:
+        raise typer.BadParameter(
+            f"unknown source {name!r}. Known: {', '.join(list_sources())}"
+        )
+
+    if name == "dmc-api":
+        _load_dotenv()
+        user = user or os.environ.get("DMC_API_USER")
+        token = token or os.environ.get("DMC_API_TOKEN")
+        if not (user and token):
+            raise typer.BadParameter(
+                "dmc-api needs credentials: pass --user/--token or set "
+                "DMC_API_USER / DMC_API_TOKEN (a .env file is auto-loaded)."
+            )
+        return cls(user, token, raw_dir=raw_dir)
+
+    if name == "vipnet" and mode:
+        return cls(raw_dir=raw_dir, mode=mode)
+
+    return cls(raw_dir=raw_dir)
+
+
+def _store(name: str, base_dir: str) -> Store:
+    if name not in Store.registry:
+        raise typer.BadParameter(
+            f"unknown store {name!r}. Known: {', '.join(sorted(Store.registry))}"
+        )
+    return Store.registry[name](base_dir)
+
+
+def _summarize(ds, label: str) -> None:
+    if not ds.data_vars:
+        print(f"[yellow]{label}: no data[/yellow]")
+        return
+    coords = [c for c in ds.coords if ds[c].dims == ("station",) and c != "station"]
+    print(f"[green]{label}[/green]  dims={dict(ds.sizes)}  "
+          f"variables={list(ds.data_vars)[:8]}  station-coords={coords}")
+
+
+# -------------------------------------------------------------------- commands
+
 @app.command()
-def get_dmc(
-    start_time: Annotated[
-        datetime,
-        typer.Argument(
-            formats=["%Y-%m-%d", "%d-%m-%Y"], help="Start time for the resulting file"
-        ),
-    ],
-    end_time: Annotated[
-        datetime,
-        typer.Argument(
-            formats=["%Y-%m-%d", "%d-%m-%Y"], help="End time for the resulting file"
-        ),
-    ],
-    user: Annotated[
-        str,
-        typer.Argument(help="User for meteochile.gob.cl Probably an Email address."),
-    ],
-    api_key: Annotated[
-        str, typer.Argument(help="Api-Key provided by meteochile.gob.cl")
-    ],
-    intermediate_path: Annotated[
-        Path,
-        typer.Option(
-            exists=True,
-            dir_okay=True,
-            file_okay=False,
-            resolve_path=True,
-            help="Folder in which to leave the intermediate files if save_intermediate is True. Also to merge with existing files if cache is True",
-        ),
-    ] = Path("./inter_data"),
-    output_path: Annotated[
-        Path,
-        typer.Option(
-            exists=True,
-            dir_okay=True,
-            file_okay=False,
-            resolve_path=True,
-            help="Folder in which to leave the resulting .netcdf file.",
-        ),
-    ] = Path("./output_data"),
-    output_name: str = typer.Option(
-        r"dmc.nc", "--output-name", "-o", help="Name of the resulting .netcdf file"
-    ),
-    timestep: str = typer.Option(
-        Timestep.N,
-        "--timestep",
-        "-t",
-        help="Time resolution for the result. If data doesn't have the resolution it provides the highest possible.",
-    ),
-    location_attr_names: str = typer.Option(
-        None,
-        "--location-attribute-names",
-        "-l",
-        help="Location attributes like 'region', 'comuna',etc. To add to netcdf as coord.",
-    ),
-    verbose: bool = typer.Option(
-        False, "--verbose", "-v", help="Verbosity of the execution."
-    ),
-    merge: bool = typer.Option(
-        False,
-        "--merge",
-        "-m",
-        help="Merge with existing files in the intermediate folder.",
-    ),
-    save_intermediate: bool = typer.Option(
-        False,
-        "--save-intermediate",
-        help="Save the intermediate tabulated files used for netcdf composition.",
-    ),
+def fetch(
+    source: Annotated[str, typer.Argument(help="Source name (see `sources`).")],
+    product: Annotated[str, typer.Argument(help="Product/variable, e.g. Temperatura, O3.")],
+    period: Annotated[str, typer.Argument(
+        help='Interval: "2024-01", "1/9/2022 to 30/9/2022", "2026-07-20 12:00".')],
+    stations: Annotated[str, typer.Option(help="Comma-separated station ids to keep.")] = None,
+    variables: Annotated[str, typer.Option(help="Comma-separated variables.")] = None,
+    raw_dir: Annotated[str, typer.Option(help="Where raw payloads land (the cache).")] = "raw",
+    to: Annotated[str, typer.Option("--to", help="Store to convert into (see `stores`).")] = None,
+    dest: Annotated[str, typer.Option("--dest", help="Destination directory for --to.")] = None,
+    append: Annotated[bool, typer.Option("--append/--overwrite",
+        help="Grow an existing --dest master instead of overwriting it.")] = False,
+    user: Annotated[str, typer.Option(help="dmc-api user (else DMC_API_USER).")] = None,
+    token: Annotated[str, typer.Option(help="dmc-api token (else DMC_API_TOKEN).")] = None,
+    mode: Annotated[str, typer.Option(help="vipnet aggregation mode.")] = None,
+    extra: Annotated[list[str], typer.Option("--extra",
+        help="Extra fetch option key=value (repeatable), e.g. min_validation_level=preliminar.")] = None,
 ):
+    """Download data from a source into the raw store, optionally converting to a master.
+
+    The raw store doubles as the cache: a period already on disk is not refetched.
+    With --to/--dest the raw is converted into the given layout; add --append to
+    grow an existing master (the cron pattern).
     """
-    Download DMC data from start_time to end_time, and process into Melodies-Monet netcdf format.
-    If wanted saves the "intermediate" tabulated data in .csv format.
-    Also able to merge downloaded data with existing data in intermediate_path
-    """
+    if to and not dest:
+        raise typer.BadParameter("--to requires --dest")
 
-    timestamps = get_timestamps(start_time, end_time, time_interval=timestep)
-    download_timestamps = timestamps
-
-    if intermediate_path != None and merge:
-        existing_timestamps = get_existing_timestamps(
-            intermediate_path, r"{\d}.csv", time_name="momento"
-        )
-        download_timestamps = list(set(download_timestamps) - set(existing_timestamps))
-
-    downloader = DMCDownloader(
-        other_data={"user": user, "api_key": api_key}, verbose=verbose
+    src = _build_source(source, raw_dir, user, token, mode)
+    extras = _parse_extras(extra or [])
+    raw = src.fetch(
+        product, period,
+        stations=_split_csv(stations),
+        variables=_split_csv(variables),
+        **extras,
     )
-    translator = DMCTranslator(
-        intermediate_path,
-        output_path,
-        verbose=verbose,
-        output_name=output_name,
-        timestep=timestep,
-    )
+    print(f"[green]fetched[/green] {source}/{product} → raw under {raw.base_dir}")
 
-    location_attr_names = (
-        location_attr_names.split(",") if location_attr_names != None else []
-    )
+    if not to:
+        _summarize(raw.read(), "raw")
+        return
 
-    print(
-        f"Downloading DMC data from {start_time.strftime("%d-%m-%Y")} to {end_time.strftime("%d-%m-%Y")}"
-    )
-    data, station = downloader.download(download_timestamps)
-
-    ddfs, station_ddf = translator.from_raw_to_intermediate_format(
-        data, station, save=save_intermediate, merge=merge, time_name="momento"
-    )
-
-    for site_id, ddf in ddfs.items():
-        ddfs[site_id]["data"] = translator.preprocess_intermediate_data(
-            ddf["data"], "momento", site_id=site_id
-        )
-
-    station_ddf = translator.preprocess_intermediate_station_data(
-        station_ddf, "codigoNacional", "latitud", "longitud"
-    )
-
-    xarray = translator.intermediate_to_xarray(
-        ddfs,
-        station_ddf,
-        location_attr_names=location_attr_names,
-        timestamps=timestamps,
-    )
-
-    xarray = translator.postprocess_xarray_data(
-        xarray, timestep=timestep, start=start_time, end=end_time
-    )
-
-    translator.xarray_to_netcdf(xarray)
-
-    return xarray
+    written = Store.change_format(raw, _store(to, dest), mode="append" if append else "overwrite")
+    print(f"[green]wrote[/green] {len(written)} file(s) as {to} under {dest}"
+          f"{' (appended)' if append else ''}")
 
 
 @app.command()
-def process_intermediate_data(
-    intermediate_path: Annotated[
-        Path,
-        typer.Argument(
-            exists=True,
-            dir_okay=True,
-            file_okay=False,
-            resolve_path=True,
-            help="Folder with the intermediate files",
-        ),
-    ] = Path("./inter_data"),
-    station_file: Annotated[
-        Path,
-        typer.Argument(
-            exists=True,
-            dir_okay=False,
-            file_okay=True,
-            resolve_path=True,
-            help=".csv file with the station info",
-        ),
-    ] = Path("./stations.csv"),
-    output_path: Annotated[
-        Path,
-        typer.Option(
-            exists=True,
-            dir_okay=True,
-            file_okay=False,
-            resolve_path=True,
-            help="Path where to leave the netcdf data.",
-        ),
-    ] = Path("."),
-    filename_regex: str = typer.Option(
-        r"(\d+).csv",
-        "--filename-regex",
-        "-r",
-        help="Regular expression of the data files.",
-    ),
-    output_name: str = typer.Option(
-        r"data_in_nc.nc", "--output-name", help="Name of the resulting .netcdf file"
-    ),
-    lat_name: str = typer.Option(
-        "Latitud",
-        "--lat-name",
-        help="Name of the latitude attribute in the station file",
-    ),
-    lon_name: str = typer.Option(
-        "Longitud",
-        "--lon-name",
-        help="Name of the longitude attribute in the station file",
-    ),
-    time_name: str = typer.Option(
-        "time", "--time-name", help="Name of the time attribute in the data files."
-    ),
-    location_attr_names: str = typer.Option(
-        None,
-        "--location-attr-names",
-        "-l",
-        help="Location attributes like 'region', 'comuna',etc. To add to netcdf as coord.",
-    ),
-    id_name: str = typer.Option(
-        "ID-Stored",
-        "--id-name",
-        help="Name of the ID attribute of observation sites in the station file",
-    ),
-    timestep: str = typer.Option(
-        Timestep.N,
-        "--timestep",
-        "-t",
-        help="Time resolution for the result. If data doesn't have the resolution it provides the highest possible.",
-    ),
-    verbose: bool = typer.Option(
-        False, "--verbosity", "-v", help="Verbosity of the execution."
-    ),
+def convert(
+    from_store: Annotated[str, typer.Argument(help="Source layout (see `stores`).")],
+    src_dir: Annotated[str, typer.Argument(help="Directory of the source store.")],
+    to_store: Annotated[str, typer.Argument(help="Destination layout.")],
+    dest: Annotated[str, typer.Argument(help="Destination directory.")],
+    append: Annotated[bool, typer.Option("--append/--overwrite",
+        help="Grow an existing destination instead of overwriting it.")] = False,
 ):
+    """Convert one store into another — reshape and reformat in one step.
+
+    Changing shape (station-per-file ↔ master) and changing format are the same
+    operation: read one store, write another.
     """
-    Process a batch of data located in intermediate_path, that is in intermediate format.
-    Intermediate format is caracterized by using wide format in tabular data, where each file
-    contains the data of 1 (one) station. It can have any number of data variables.
-    """
-
-    location_attr_names = (
-        location_attr_names.split(",") if location_attr_names != None else []
+    written = Store.change_format(
+        _store(from_store, src_dir), _store(to_store, dest),
+        mode="append" if append else "overwrite",
     )
+    print(f"[green]wrote[/green] {len(written)} file(s) as {to_store} under {dest}"
+          f"{' (appended)' if append else ''}")
 
-    translator = Translator(
-        intermediate_path,
-        output_path,
-        raw_path=None,
-        verbose=verbose,
-        intermediate_filename_regex=filename_regex,
-        station_filename=station_file,
-        output_name=output_name,
-        timestep=timestep,
-    )
 
-    data, station_ddf = translator.load_intermediate_data(
-        time_name, id_name, lat_name, lon_name
-    )
+@app.command()
+def sources():
+    """List the registered data sources."""
+    for name in list_sources():
+        print(name)
 
-    xarray = translator.intermediate_to_xarray(
-        data, station_ddf, location_attr_names=location_attr_names
-    )
-    translator.xarray_to_netcdf(xarray)
+
+@app.command()
+def stores():
+    """List the registered storage layouts."""
+    for name in sorted(Store.registry):
+        print(name)
 
 
 if __name__ == "__main__":

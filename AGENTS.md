@@ -1,18 +1,20 @@
 # AtmosphereData-CL
 
-Library and CLI for downloading atmospheric data products — station networks, model output,
-satellite retrievals — and reshaping them into master files and master *directories* in
-arbitrary formats and layouts.
+Library and CLI for downloading atmospheric data products — station networks today;
+model output and satellite retrievals to come — and reshaping them into master files
+and master *directories* in arbitrary formats and layouts.
 
-The end state is a crontab-driven daily run that extends those masters incrementally.
+Changing format (`.csv`, `.netcdf`, …) and changing shape (station-per-file, single
+master, date-partitioned directory) are **the same operation**: read one store, write
+another. The production goal is a crontab-driven daily run that **extends** masters
+incrementally rather than rewriting them.
 
-> **Status:** this document records the agreed architecture. Most of it is **not yet
-> implemented** — see [Current state](#current-state) for what actually exists today, and
-> [Next steps](#next-steps) for the order of work.
+> **Status:** built and live-verified against all three real endpoints. 95 tests
+> pass. Reachable end-to-end from the CLI. The old MonetioCL pipeline
+> (`data_download/`, `translate/`) has been deleted. See [EXPLANATION.md](EXPLANATION.md)
+> for the mechanical deep-dive.
 
 ## Identity
-
-The project was previously called *MonetioCL*. The rename has been applied.
 
 | | |
 |---|---|
@@ -21,146 +23,130 @@ The project was previously called *MonetioCL*. The rename has been applied.
 | CLI command | `AtmosphereData-CL` |
 | Reference implementations | `REF_ONLY/`, gitignored |
 
-Note: `melodies-monet-format` keys in `src/config/config.json` and the `Melodies-Monet`
-mentions in `translate/translator.py` docstrings refer to the **external** NOAA tool, not to
-this project. They are not part of the rename. Melodies-MONET is one supported *output
-target*, no longer the purpose of the project.
-
 ## Architecture
 
 ```
-Source ──> raw store (== cache) ──> Processor ──> Store(s)
+Source ──fetch──> RawStore (== cache) ──change_format──> Store(s)
 ```
 
-Three layers, each independently extensible.
+Two extensible layers joined by one canonical intermediate — an xarray
+`(time, station)` Dataset. `Source` is acquisition; `Store` is shape+format. A
+`RawStore` is the raw download presented as a readable Store, so *everything*
+downstream is "read one store, write another".
 
-### Source — acquisition
+### Source — acquisition (`sources/`)
 
-A Source is **one access method**, not one organisation. This is the load-bearing decision:
-DMC splits into two separate Sources because they share no auth and no transport, and
-therefore should share no class.
+A Source is **one access method**, not one organisation — the load-bearing decision.
+DMC splits into `dmc-api` (the API client, built) and future `dmc-web` (a scraper for
+series the API doesn't serve) because they share no auth and no transport.
 
-- **`dmc-api`** — the httpx client against the DMC API. This is what the current code does.
-- **`dmc-web`** — a scraper for series the API does not serve, such as *Precipitación Diaria
-  Histórica*. Pending: the user has a working scraper and the URL to provide.
+Implemented: `Sinca`, `Vipnet`, `DmcApi` (import them from
+`atmosphere_data_cl.sources`; list with `list_sources()` / the `sources` CLI command).
 
-Properties of a Source:
+A Source declares its shape as **data**, and a shared driver runs it:
 
-- Registered in a registry, tagged with a **kind**: `PointSurface`, `Gridded`, `Satellite`, …
-- Exposes named **products** — the resolutions and series available through that access
-  method. Adding a resolution should be a table entry, not a new class.
-- Emits data **as downloaded**. It converts only when the native form is hostile to analysis
-  (HTML → csv/json). Fidelity to the source is the default; normalization is the exception.
-- Canonical emitted formats: `.csv`, `.json`, `.netcdf`. Recommended additions: `.parquet`
-  (columnar, typed, compresses well, dask reads it natively) and `.zarr` for the
-  gridded/satellite side.
-- Importable standalone, so a Source is useful without the CLI:
+- `kind` — data family and registry bucket: `PointSurface` (all three today),
+  `Gridded`, `Satellite`.
+- `discovery` — how station metadata is obtained: `required` (SINCA/DMC scrape or
+  list stations first — it yields the routing key), `derived` (Vipnet — metadata
+  rides in every response), `none`.
+- `time_grain` — the largest span one request covers. `None` = arbitrary from/to in
+  one request (SINCA); `"hour"`/`"month"` = a range fans out into buckets.
+- `_plan_axes` declares which axes fan out into separate requests and which collapse.
+  This is the crux: SINCA and Vipnet decompose the same (station × variable × time)
+  cube in *inverted* ways, and the declaration captures that without per-source loops.
 
-  ```python
-  from atmosphere_data_cl.sources import DMCApi
-  ds = DMCApi(user, api_key).fetch("ema_hourly", period="2026-07")
-  ```
+The driver owns retries+backoff, connection pooling, and skip-if-cached — so every
+source inherits them. `source.fetch(product, period, ...)` returns a **`RawStore`**;
+nothing is parsed until you read or convert it.
 
-### Raw store — the output *is* the cache
-
-A Source writes into its own Store. A period's file being present means "already fetched,
-skip it." One concept rather than two, browsable on disk, and no bytes duplicated between a
-cache and an output directory.
-
-```
-raw/dmc-api/ema_hourly/2026/07/20.json   <- exists, skipped
-raw/dmc-api/ema_hourly/2026/07/21.json   <- fetched tonight
+```python
+from atmosphere_data_cl.sources import Vipnet
+raw = Vipnet().fetch("Temperatura", "2026-07-20 12:00")   # RawStore, unparsed
 ```
 
-Cache keying is therefore just source + product + period, expressed as a path.
+### Raw store — the download *is* the cache
 
-### Store — `base_directory` + formatting rule + format
+A Source writes each payload to disk exactly as downloaded, keyed **by path**: the
+per-file axes live in the path (no sidecars, no manifest), so a `RawStore` can recover
+them later with `parse_template`. A file being present means "already fetched, skip".
 
-The key abstraction. It absorbs **both** shape and format transformation, which is why there
-is no separate "reshaper" concept.
+The path is a `variable` folder plus station/height/dates in the filename — deep
+nesting was deliberately avoided:
 
-A *master* is just a Store. It may be a single file or a directory tree, and the path rule
-**is** the shape:
+```
+raw/vipnet/temperatura/20260720T1200.json
+raw/sinca/O3/EMA_x__na__20220901-20220930.csv        {variable}/{station}__{height}__{from}-{to}.csv
+raw/dmc-api/330020__2024-01.json                     {station}__{time}.json
+```
 
-| Rule | Result |
+`RawStore(source, base_dir)` reads that tree back into a Dataset by delegating each
+file to the bound Source's parser — including the offline case (no live source, no
+network): `RawStore(Vipnet, "raw/vipnet").read()`.
+
+### Store — `base_dir` + path template + format (`store/`)
+
+A Store is a **handle bound to a directory** with two symmetric directions:
+`read() -> Dataset` and `write(ds) -> paths`. The path template *is* the shape; the
+encoder *is* the format. Implemented layouts (list with the `stores` CLI command):
+
+| Store | Shape |
 |---|---|
-| `master.nc` | single master file |
-| `{year}/{month}/{day}.parquet` | daily-partitioned master directory |
-| `{siteid}.csv` | station-per-file |
-| `{variable}.nc` | variable-per-file |
+| `single-netcdf` | one compressed `master.nc`, all stations & variables |
+| `one-csv-per-station` | one wide `.csv` per station (+ `stations.csv` sidecar) |
 
-Consequences worth keeping in mind:
+Because a `RawStore` is the same kind of handle, one verb covers conversion,
+reshaping, and reformatting:
 
-- Converting between shapes and converting between formats are **the same operation**: read
-  one Store, write another.
-- Requesting a format the data already has is a **no-op**.
-- A cron append writes only the partition the new data belongs to — nothing large is
-  rewritten, which is what makes the daily run cheap.
-
-### Processor
-
-Reads the canonical formats, appends into Stores, transforms between them. Owns resampling
-and time-resolution logic — the useful parts of today's `postprocess_xarray_data`.
-
-## Current state
-
-The repo today is a 3-stage funnel hardwired to DMC station observations:
-**raw JSON → per-station CSV → one master NetCDF**.
-
-```
-src/atmosphere_data_cl/
-├── cli.py                     typer app: get_dmc, process_intermediate_data
-├── data_download/
-│   ├── downloader.py          Downloader (base)
-│   └── dmc_downloader.py      DMCDownloader
-├── translate/
-│   ├── translator.py          Translator (base, also concretely usable)
-│   └── dmc_translator.py      DMCTranslator
-├── utils/{utils,config}.py
-└── config/config.json
+```python
+Store.change_format(src, dst)                 # dst.write(src.read())
+Store.change_format(src, dst, mode="append")  # grow dst instead of overwriting
 ```
 
-### Migration map
+Two properties worth knowing:
 
-| Today | Becomes |
-|---|---|
-| `DMCDownloader` | `dmc-api` Source |
-| `{siteid}.csv` intermediate (`translate/translator.py:93`) | Store with rule `{siteid}.csv` |
-| single NetCDF output | Store with rule `master.nc` |
-| `intermediate_to_xarray` (`translate/translator.py:380`) | reusable as the `PointSurface` canonical representation |
+- **Station metadata travels with the data.** `station_metadata()` normalizes each
+  source's discovery columns to `station/latitude/longitude/name/...`; it lands as
+  **coordinates** in NetCDF/Zarr and as a **`stations.csv` sidecar** for tabular
+  layouts.
+- **Growing masters are the cron primitive.** `Store.append(ds)` (or
+  `change_format(..., mode="append")`) unions times/stations/variables with **new data
+  winning on overlap**, is **idempotent** (re-running a period doesn't duplicate), and
+  **atomic** (temp-file + rename, so a crashed run can't corrupt the master).
 
-`cli.py:173`'s `process_intermediate_data` is already source-agnostic and maps cleanly onto
-Store-to-Store conversion.
+### CLI (`cli.py`)
 
-## Known broken things
+Generic verbs over the registries — any source/store works without a new command:
 
-Read this before picking up any task here.
+- `fetch SOURCE PRODUCT PERIOD [--to STORE --dest DIR --append] [--stations/--variables/--extra ...]`
+- `convert FROM_STORE SRC_DIR TO_STORE DEST [--append]`
+- `sources` / `stores` — list what's registered.
 
-- **`utils/config.py` is dead and crashes on import.** It opens `"..\\config\\config.json"`
-  with Windows separators (`utils/config.py:10`), at class-body evaluation time — so importing
-  it raises `FileNotFoundError` on Linux. Nothing imports it. Superseded by the Store and
-  registry design; the real config today is an inline `file_info` dict at
-  `translate/translator.py:82`, hardcoded URLs at `data_download/dmc_downloader.py:90`, and
-  hardcoded column names in `cli.py`.
+DMC creds come from `DMC_API_USER`/`DMC_API_TOKEN` (a `.env` is auto-loaded) or
+`--user/--token`.
 
-- **No tests exist.** No test directory, no test dependency. Establish tests before moving
-  pipeline logic — the restructuring is otherwise unguarded.
+## What's implemented vs. remaining
 
-- `Downloader` and `Translator` use `@abstractmethod` **without inheriting `ABC`**, so the
-  decorators are advisory only and contract violations surface as `None` at runtime rather
-  than at instantiation. `cli.py:258` instantiates the bare `Translator` deliberately.
+**Done:** the Source driver + `sinca`/`vipnet`/`dmc-api`; path-encoded raw store;
+`RawStore`; `single-netcdf` + `one-csv-per-station`; metadata threading; growing
+(appendable) masters; the CLI; 95 tests; live-verified.
 
-## Next steps
+**Remaining / future:**
 
-1. ~~**Rename + packaging fix.**~~ Done — tree moved to `src/atmosphere_data_cl/`,
-   `[tool.setuptools]` added, entrypoint and deps fixed. `pip install -e .` works.
-2. ~~**Source layer + 3 sources.**~~ Done — `sources/` with declarative fan-out, registry,
-   shared driver (retries + skip-if-cached); `sinca`, `vipnet`, `dmc-api` ported. `store/`
-   has `OneCsvPerStation` and `SingleNetcdf`. 81 tests, all offline.
-3. **Store layer proper** — `_split` for arbitrary path templates, `_merge_existing` for
-   incremental cron appends, partitioned master directories, parquet/zarr encoders. Then
-   retire `data_download/` and `translate/`.
-4. **`REF_ONLY/` remaining work**; user provides the DMC-WEB scraper and its
-   URL. The Source abstraction should be shaped by these real implementations rather than
-   guessed at ahead of them.
-3. **Build the Source registry and Store abstraction**, starting with `dmc-api`.
+- More output layouts & serializers: variable-per-file, date-partitioned master
+  *directories* (`{year}/{month}/{day}.ext`, which append cheaply by writing only the
+  new partition), and `.parquet` / `.zarr` / `.json` / `.xlsx` encoders.
+- SINCA station lat/lon (needs a per-station-card scrape; name/region work today).
+- `dmc-web` scraper for series the API doesn't serve.
+- Gridded / Satellite sources, and time/space resampling.
+
+## Notes for whoever picks this up
+
+- Run and test via the repo venv: `venv/bin/python -m pytest -q` (see the
+  `use-project-venv` memory). Tests live in `tests/`, scoped in `pyproject.toml` so
+  `REF_ONLY/`'s own suites are ignored.
+- SINCA's `psgraph:` responses mean "this station has no such series" — kept in the
+  raw store (so we don't refetch) and omitted on transform (empty parse). Not an error.
+- Adding a source = one module in `sources/` (declare `kind/name/discovery/time_grain`,
+  a `raw_template`, and implement `_plan_axes`/`_build_request`/`_parse`/`_identity`);
+  `__init_subclass__` registers it. Adding a layout = one `Store` subclass in `store/`.

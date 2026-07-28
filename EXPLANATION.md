@@ -1,50 +1,48 @@
 # Source & Store — a deep explanation
 
 This document explains the two core abstractions of AtmosphereData-CL — **Source**
-(acquisition) and **Store** (shape + format) — how each abstract base class is
-built, a full worked example, and how the two layers meet.
+(acquisition) and **Store** (shape + format) — how each base class is built, a full
+worked example, and how the two layers meet.
 
-For the high-level architecture and project status see [AGENTS.md](AGENTS.md).
-This document is the *mechanical* companion: how the classes actually work.
+For the high-level architecture and status see [AGENTS.md](AGENTS.md). This is the
+*mechanical* companion: how the classes actually work.
 
 ---
 
 ## 1. The mental model
 
 ```
-   Source                       raw store (= cache)              Store / layout
- ─────────                    ─────────────────────           ──────────────────
- how you GET data     ───►    every payload as-downloaded  ───►  how you SHAPE
- (1 class per                 raw/<source>/<job>.<fmt>           & FORMAT data out
-  access method)              (existing files skip refetch)      {station}.csv
-                                                                 master.nc
-                                                                 {year}/{month}/{day}.parquet
+   Source                    RawStore (= cache)               Store / layout
+ ─────────                ──────────────────────           ──────────────────
+ how you GET data   ──►   every payload as-downloaded,  ──►  how you SHAPE
+ (1 class per             its axes encoded in the path       & FORMAT data out
+  access method)          raw/<source>/<var>/<...>.<fmt>      single-netcdf
+                          (present ⇒ skip refetch)            one-csv-per-station
 ```
 
-The bridge between the two layers is a **canonical long DataFrame**:
+The bridge between the two layers is a **canonical `(time, station)` xarray
+Dataset**. A `RawStore` produces it (`read()`), and a `Store` consumes it
+(`write(ds)`). Because a `RawStore` is itself a readable handle, conversion is
+uniform: **read one handle, write another**.
 
-```
-[ timestamp | station | variable | value | unit ]
-```
-
-A Source *can* produce it (via `_parse`), and a Store *consumes* it (via
-`write`). Neither layer knows anything else about the other. That is the whole
-decoupling.
+Internally, the step from raw payload to Dataset goes through a long DataFrame
+`[timestamp, station, variable, value, unit]` — that's what a Source's `_parse`
+emits and what `long_to_dataset` pivots into the cube. But you rarely touch it; the
+public interchange is the Dataset.
 
 ---
 
 ## 2. Source — the acquisition abstraction
 
-File: [src/atmosphere_data_cl/sources/source.py](src/atmosphere_data_cl/sources/source.py)
+File: [source.py](src/atmosphere_data_cl/sources/source.py)
 
 A Source is **one way of getting data** — not one organisation. DMC splits into
 `dmc-api` and (future) `dmc-web` because they share no auth and no transport.
 
 The base class solves one hard problem: different sources decompose the
-`(station × variable × time)` cube in *incompatible* ways, so **request
-construction cannot be shared** — but the **driver** (the loop that runs
-requests, retries them, caches them, pools the connection) can be. So a source
-declares its shape as *data*, and the base class runs it.
+`(station × variable × time)` cube in *incompatible* ways, so **request construction
+can't be shared** — but the **driver** (loop, retries, caching, connection pool)
+can. A source declares its shape as *data*; the driver runs it.
 
 ### 2a. What a subclass declares
 
@@ -55,314 +53,242 @@ class Vipnet(Source):
     discovery = "derived"     # required | derived | none
     time_grain = "hour"       # one request covers one hour  → time fans out hourly
     native_format = "json"    # what one raw payload is on disk
+    raw_template = "{variable}/{time}.{ext}"   # where each raw file lives
+    station_meta_map = {...}  # discovery columns → normalized lat/lon/name
 ```
 
-- **`kind`** tags the data family and is the first key of the two-level registry
-  ([source.py:96](src/atmosphere_data_cl/sources/source.py#L96),
-  [source.py:114](src/atmosphere_data_cl/sources/source.py#L114)).
-- **`discovery`** says how station metadata is obtained:
-  - `required` — must run *before* any fetch because it yields the routing key
-    (SINCA's `airviro_id`). The driver enforces this
-    ([source.py:280](src/atmosphere_data_cl/sources/source.py#L280)).
-  - `derived` — falls out of every data response (Vipnet). Harvested by
-    `_accumulate_discovery` on every payload.
-  - `none` — the source has no station concept.
-- **`time_grain`** is the largest span one request can cover. `None` means the
-  source takes an arbitrary from/to range and time *does not fan out at all*
-  (SINCA). `"hour"`/`"month"` mean a range is chopped into buckets of that size.
+- **`kind`** — data family + first key of the two-level registry
+  ([source.py:124](src/atmosphere_data_cl/sources/source.py#L124)).
+- **`discovery`** — how station metadata is obtained: `required` (must run before
+  any fetch because it yields the routing key, e.g. SINCA's `airviro_id`), `derived`
+  (rides in every response — Vipnet), `none`.
+- **`time_grain`** — largest span one request covers. `None` = arbitrary from/to in
+  one request (SINCA); `"hour"`/`"month"` = a range is chopped into buckets.
+- **`raw_template`** — the per-file path. Its fields *are* the file's identity, so a
+  `RawStore` can recover them later with `parse_template`.
 
-### 2b. The four hooks a subclass implements
+### 2b. The hooks a subclass implements
 
 | Hook | Signature | Responsibility |
 |---|---|---|
-| `_plan_axes` | `(spec) -> {axis: [values]}` | Which axes **fan out**. Axes not returned **collapse** into a single request. |
-| `_build_request` | `(job) -> Request` | Build the transport-agnostic HTTP description for one job. |
-| `_parse` | `(payload, job) -> DataFrame` | One response → canonical long frame. **Only called when converting.** |
+| `_plan_axes` | `(spec) -> {axis: [values]}` | Which axes **fan out**. Axes not returned **collapse** into one request. |
+| `_identity` | `(job) -> {str: str}` | The per-file axes as path-safe strings (fills `raw_template`; also the parse context). |
+| `_build_request` | `(job) -> Request` | Build the transport-agnostic HTTP call for one job. |
+| `_parse` | `(payload, ctx) -> DataFrame` | One payload → canonical long frame. Runs only on read/convert. |
 | `discover_stations` | `() -> DataFrame` | Station metadata. Required for `discovery="required"`. |
 
-Everything else is the base class's job.
+The clever part: `_parse` takes a flat **context dict** (`ctx`), not a live `Job`.
+Live fetch builds it via `_identity(job)`; a disk read builds the *same* dict by
+parsing the filename. So parsing works identically whether the payload just arrived
+or was picked up off disk with no live source.
 
-### 2c. What the base class owns (the driver)
+### 2c. What the driver owns
 
-Three dataclasses carry state through the pipeline:
+Three dataclasses thread state through the pipeline:
 
-- **`FetchSpec`** ([source.py:39](src/atmosphere_data_cl/sources/source.py#L39)) —
-  the whole request bundled into one object (`product`, `start`, `end`,
-  `stations`, `variables`, `extras`). `extras` is the open-ended escape hatch for
-  source-specific knobs (SINCA's `min_validation_level`, Vipnet's `mode`) so the
-  base signature never grows.
-- **`Job`** ([source.py:60](src/atmosphere_data_cl/sources/source.py#L60)) — one
-  request to make, with a filesystem-safe `key` that is *also its raw-store
-  filename*.
-- **`Request`** ([source.py:77](src/atmosphere_data_cl/sources/source.py#L77)) — a
-  transport-agnostic description of one HTTP call (url, method, params, json_body,
-  headers, timeout). SINCA returns a GET; Vipnet a POST — same dataclass.
+- **`FetchSpec`** ([source.py:40](src/atmosphere_data_cl/sources/source.py#L40)) —
+  the whole request in one object (`product`, `start`, `end`, `stations`,
+  `variables`, `extras`). `extras` is the escape hatch for source-specific knobs
+  (SINCA's `min_validation_level`, Vipnet's `mode`) so the base signature never grows.
+- **`Job`** ([source.py:61](src/atmosphere_data_cl/sources/source.py#L61)) — one
+  request to make.
+- **`Request`** ([source.py:78](src/atmosphere_data_cl/sources/source.py#L78)) — a
+  transport-agnostic HTTP description. SINCA is a GET; Vipnet a POST — same dataclass.
 
-The driver methods:
+Driver methods: `plan(spec)`
+([source.py:228](src/atmosphere_data_cl/sources/source.py#L228)) expands
+`_plan_axes × time buckets` into a flat `list[Job]` (pure, cheap, what the plan tests
+assert); `_execute(job)`
+([source.py:279](src/atmosphere_data_cl/sources/source.py#L279)) cache-checks then
+sends and saves the raw payload; `_send`
+([source.py:293](src/atmosphere_data_cl/sources/source.py#L293)) retries with backoff.
 
-- **`plan(spec)`** ([source.py:153](src/atmosphere_data_cl/sources/source.py#L153))
-  — expands `_plan_axes` × time buckets into a flat `list[Job]`. Pure and cheap;
-  this is what the plan tests assert against.
-- **`_execute(job)`** ([source.py:201](src/atmosphere_data_cl/sources/source.py#L201))
-  — cache-checks (`raw_path.exists()` → load and short-circuit), else builds +
-  sends the request and saves the raw payload.
-- **`_send(request)`** ([source.py:215](src/atmosphere_data_cl/sources/source.py#L215))
-  — retries with exponential backoff. Neither reference implementation had
-  retries; every source inherits them here for free.
-- **`fetch(...)`** ([source.py:254](src/atmosphere_data_cl/sources/source.py#L254))
-  — the public entrypoint. **This is the contract that matters:**
+### 2d. The `fetch` contract
 
 ```python
-def fetch(self, product, period, stations=None, variables=None,
-          format=None, use_cache=True, **extras):
-    ...
-    for job in self.plan(spec):
-        payload = self._execute(job, use_cache=use_cache)   # HTTP or cache
-        if self.discovery == "derived":
-            self._accumulate_discovery(payload, job)        # station harvest
-        collected.append((job, payload))
-
-    if format is None:
-        return {job.key: payload for job, payload in collected}   # ← NATIVE
-
-    frames = [self._parse(payload, job) for job, payload in collected ...]
-    data = pd.concat(frames, ...)
-    return format.write_from_long(data, source=self, spec=spec)   # ← CONVERTED
+raw = Vipnet().fetch("Temperatura", "2026-07-20 12:00")   # → a RawStore
 ```
 
-Two things to burn in:
+`fetch` ([source.py:332](src/atmosphere_data_cl/sources/source.py#L332)) plans the
+jobs, `_execute`s each (HTTP or cache), and **returns a `RawStore`** bound to the raw
+directory. **Nothing is parsed** — parsing is the cost of reading/converting, never
+of acquiring. Passing `format=<Store>` + `dest=` converts immediately (sugar over
+`change_format`) and returns the written paths.
 
-1. **No `format` → returns payloads exactly as downloaded**, keyed by job. No
-   parsing, no reshaping. `_parse` is the *cost of converting*, never paid on the
-   default path.
-2. **Station discovery is separate from parsing.** `_accumulate_discovery`
-   ([source.py:150](src/atmosphere_data_cl/sources/source.py#L150)) runs on every
-   payload — native or converted — so a native fetch still populates
-   `discover_stations()`. (This is why the harvest is *not* inside `_parse`.)
+Station discovery is decoupled from parsing: for `discovery="derived"` the driver
+calls `_accumulate_discovery(items)`
+([source.py:216](src/atmosphere_data_cl/sources/source.py#L216)) **once per fetch**
+(not per request) to union the station table — so `discover_stations()` is populated
+by acquisition, independent of whether you ever parse.
 
-### 2d. The registry
+### 2e. The registry
 
-`__init_subclass__` auto-registers every subclass, and importing the `sources`
-package imports every module so the registry is populated
-([sources/__init__.py](src/atmosphere_data_cl/sources/__init__.py)). Look one up
-by name:
+`__init_subclass__` auto-registers every subclass; importing `sources` imports every
+module so lookups resolve.
 
 ```python
 from atmosphere_data_cl.sources import get_source, list_sources
-list_sources()            # ['dmc-api', 'sinca', 'vipnet']
-get_source("vipnet")      # <class Vipnet>
+list_sources()          # ['dmc-api', 'sinca', 'vipnet']
+get_source("vipnet")    # <class Vipnet>
 ```
 
 ---
 
 ## 3. Store — the shape + format abstraction
 
-File: [src/atmosphere_data_cl/store/store.py](src/atmosphere_data_cl/store/store.py)
+File: [store.py](src/atmosphere_data_cl/store/store.py)
 
-A Store is **base directory + path template + format**. The path template *is*
-the shape and the encoder *is* the format, so "convert between shapes" and
-"convert between formats" are the same operation: read one Store, write another.
-
-### 3a. What a subclass declares + implements
+A Store is a **handle bound to a directory** — `OneCsvPerStation("out")` — with two
+symmetric directions. The path template *is* the shape; the encoder *is* the format.
 
 ```python
 class OneCsvPerStation(Store):
     name = "one-csv-per-station"
-    template = "{station}.csv"        # the shape: one file per station
-    suffix = ".csv"                   # the format
-
-    @classmethod
-    def write(cls, long, base_dir) -> list[Path]: ...   # long frame → files
-    @classmethod
-    def read(cls, base_dir) -> xr.Dataset: ...          # files → canonical Dataset
+    template = "{station}.csv"
+    def write(self, ds) -> list[Path]: ...   # Dataset → files (+ metadata sidecar)
+    def read(self) -> xr.Dataset: ...        # files → canonical (time, station) Dataset
 ```
 
-The abstract base ([store.py:62](src/atmosphere_data_cl/store/store.py#L62))
-declares `write` and `read` as the two required directions, plus
-`write_from_long` — the entry point `Source.fetch` calls.
+- **`write`** ([store.py:187](src/atmosphere_data_cl/store/store.py#L187)) — one wide
+  CSV per station (rows=time, cols=variables), each written atomically; station
+  metadata coords go to a `stations.csv` sidecar.
+- **`read`** ([store.py:214](src/atmosphere_data_cl/store/store.py#L214)) — glob the
+  CSVs, rebuild the Dataset, reattach the sidecar metadata.
+- **`SingleNetcdf`** ([store.py:238](src/atmosphere_data_cl/store/store.py#L238)) —
+  one compressed `master.nc`; metadata stays inline as coords.
 
-### 3b. Stores own BOTH directions (the part ClimateGraph lacked)
+`long_to_dataset` ([store.py:36](src/atmosphere_data_cl/store/store.py#L36)) builds
+the `(time, station)` cube natively (NaN-filling ragged variable/station coverage),
+and `attach_station_metadata`
+([store.py:62](src/atmosphere_data_cl/store/store.py#L62)) adds lat/lon/name as
+coordinates on the station dim.
 
-ClimateGraph's reader was a **funnel**: many layouts in, but a single hardcoded
-`ds.to_netcdf()` out. It could *read* `{station}.csv` but not *write* it. So the
-write half here is new work. `OneCsvPerStation`:
+### 3a. Growing stores — the cron primitive
 
-- **write** ([store.py:104](src/atmosphere_data_cl/store/store.py#L104)) —
-  `groupby("station")`, pivot each group to wide (rows=time, cols=variables),
-  `atomic_write` one CSV per station.
-- **read** ([store.py:121](src/atmosphere_data_cl/store/store.py#L121)) — glob the
-  CSVs, melt each back to long, `long_to_dataset` into a `(time, station)`
-  Dataset — the exact shape ClimateGraph's `station_per_file` reader produces.
+```python
+Store.append(ds)                              # merge into what's already stored
+Store.change_format(raw, master, mode="append")
+```
 
-`long_to_dataset` ([store.py:34](src/atmosphere_data_cl/store/store.py#L34)) is
-the pivot that both Stores share, and the canonical `(time, station)` xarray form.
+`append` ([store.py:135](src/atmosphere_data_cl/store/store.py#L135)) read-modify-
+writes: it `combine_first`s the new data over the existing master, so times/stations/
+variables **union** and **new data wins on overlap** (a preliminary→validated
+re-fetch takes effect). It's **idempotent** (re-running a period adds no duplicates)
+and **atomic** (temp-file + `os.replace`). It also re-attaches station metadata,
+which `combine_first` would otherwise drop.
 
-`SingleNetcdf` ([store.py:137](src/atmosphere_data_cl/store/store.py#L137)) is the
-master-file layout: one compressed `.nc` with zlib encoding and a provenance
-`history` attribute via `record()`.
+### 3b. `RawStore` — the raw download as a readable handle
 
-### 3c. Shared infrastructure the Stores lean on
+File: [raw.py](src/atmosphere_data_cl/store/raw.py)
 
-From [utils/paths.py](src/atmosphere_data_cl/utils/paths.py):
-`render_template` (build `{year}/{month}/{day}.parquet` paths, zero-padding time
-fields so lexical order = chronological order) and `atomic_write` (temp file +
-`os.replace`, so a crashed 3am cron can't corrupt a master).
+`RawStore` is deliberately dumb: it knows only "a directory of raw files laid out
+under a Source's `raw_template`". It borrows the *interpretation* from the Source it's
+bound to — each file's axes are recovered from its path, and the Source's own
+`_parse` turns the payload into records. So the same class serves two flows:
+
+```python
+raw = Vipnet().fetch("Temperatura", "2026-07-20 12:00")   # bound to a live source
+raw.read()
+
+RawStore(Vipnet, "raw/vipnet").read()   # picked straight off disk, no network
+```
+
+Because it exposes `read() -> Dataset` like any Store, `change_format` treats it
+identically to an on-disk layout.
 
 ---
 
-## 4. A full worked example — Vipnet, native then converted
+## 4. A full worked example — Vipnet
 
 ```python
 from atmosphere_data_cl.sources import Vipnet
-from atmosphere_data_cl.store import OneCsvPerStation
+from atmosphere_data_cl.store import SingleNetcdf, OneCsvPerStation, Store
 ```
 
-### Step 1 — native fetch
+### Fetch
 
 ```python
-raw = Vipnet(raw_dir="raw").fetch("Temperatura", "9/9/2022")
+raw = Vipnet(raw_dir="raw").fetch("Temperatura", "2026-07-20")
 ```
 
-What happens inside:
+1. `"2026-07-20"` → interval `(00:00, 23:59:59.999)`.
+2. `_plan_axes` fans out **variable** = `["Temperatura"]`; stations collapse (every
+   request is network-wide). `time_grain="hour"` → **24 jobs**.
+3. Each job → a POST to the VipNet endpoint; `_execute` saves the raw JSON.
+4. `discovery="derived"` → the station table is unioned into `stations.csv` once.
+5. Returns a **`RawStore`** — nothing parsed yet.
 
-1. `"9/9/2022"` → `manage_time_interval` → `(2022-09-09 00:00, 2022-09-09 23:59:59.999)`.
-2. `_plan_axes` fans out **variable** = `["Temperatura"]`; stations collapse
-   (every request is network-wide). `time_grain="hour"` chops the day into **24**
-   buckets. → **24 jobs**.
-3. For each job `_build_request` builds a POST to
-   `https://vipnet.mop.gob.cl/v1/vipnet/estaciones/valor` with
-   `{tipoEstacion: 1, fetchHour: h, fetchDay: "2022-09-09", ...}`.
-4. `_execute` sends it (or loads the cached file), saving the raw JSON.
-5. `discovery == "derived"` → `_accumulate_discovery` unions the station
-   metadata from each response into `stations.csv`.
-6. `format is None` → return the payloads as-downloaded.
-
-**On disk:**
+**On disk** (raw = as downloaded; axes in the path):
 
 ```
 raw/vipnet/
-  stations.csv                                           ← accumulated union
-  temperatura__end-...t0059__start-...t0000__...json     ← hour 0
-  temperatura__end-...t0159__...json                     ← hour 1
+  stations.csv                        ← accumulated station union
+  temperatura/20260720T0000.json      ← hour 0
+  temperatura/20260720T0100.json      ← hour 1
   ...  (24 files)
 ```
 
-**What comes out** — a dict keyed by job, values are the raw JSON payloads
-(the self-describing envelope Vipnet wraps):
+### Read or convert
 
 ```python
-{
-  "temperatura__end-20220909t0059__start-20220909t0000__variable-temperatura": {
-      "variable": "Temperatura",
-      "unit": "°C",
-      "data": [
-          {"codigoEstacion": "02113005-2", "nombre": "GUATACONDO",
-           "region": 1, "latitud": -20.93, "longitud": -69.05, "value": 12.4},
-          ...
-      ]
-  },
-  ...  # 24 entries
-}
+ds = raw.read()                                    # → (time=24, station=N) Dataset
+                                                   #    with lat/lon/name coords
+
+Store.change_format(raw, SingleNetcdf("out"))      # → out/master.nc
+Store.change_format(raw, OneCsvPerStation("out2")) # → out2/<station>.csv + stations.csv
 ```
 
-Nothing was parsed or reshaped. `stations.csv` is populated as a side effect.
+`read()` parses each cached file (via `Vipnet._parse` on the path-recovered context),
+concatenates the long frames, pivots to the cube, and attaches metadata.
 
-### Step 2 — converted fetch (same call, one argument added)
+### Grow it tomorrow
 
 ```python
-paths = Vipnet(raw_dir="raw").fetch("Temperatura", "9/9/2022", format=OneCsvPerStation)
+raw2 = Vipnet(raw_dir="raw").fetch("Temperatura", "2026-07-21")
+Store.change_format(raw2, SingleNetcdf("out"), mode="append")   # master now spans 2 days
 ```
-
-The 24 payloads are already cached (step 1), so **no HTTP happens**. This time
-`format` is set, so:
-
-1. Each payload → `_parse` → a long frame slice
-   `[timestamp, station, variable, value, unit]`.
-2. `pd.concat` → one long frame for the whole day.
-3. `OneCsvPerStation.write_from_long` → `write` groups by station and writes one
-   wide CSV each.
-
-**What comes out** — the list of written paths:
-
-```python
-[PosixPath('raw/one-csv-per-station/02113005-2.csv'),
- PosixPath('raw/one-csv-per-station/02120001-K.csv'),
- ...]
-```
-
-and each file is wide:
-
-```
-timestamp,           temperatura
-2022-09-09 00:00:00, 12.4
-2022-09-09 01:00:00, 12.1
-...
-```
-
-> **Known rough edge (roadmap item):** the output currently lands under
-> `raw/one-csv-per-station/` because `write_from_long`
-> ([store.py:87](src/atmosphere_data_cl/store/store.py#L87)) derives `base_dir`
-> from the source's `raw_dir`. The output directory should be a caller-chosen
-> argument, not a sibling of the cache. Slated to be fixed when the CLI is wired.
 
 ---
 
 ## 5. How Source and Store interact
 
-They meet at exactly **two points**, and nowhere else:
+They meet at exactly **two points**:
 
-1. **`Source.fetch(format=SomeStore)`** is the only place a Source references a
-   Store. It hands the Store a long DataFrame via `write_from_long`. The Source
-   never imports a Store class — you pass one in.
+1. **`RawStore`** — a Source's `fetch` returns one; it's the adapter that makes raw
+   downloads readable as a Store, delegating parsing back to the Source.
+2. **The canonical `(time, station)` Dataset** — every handle's `read()` produces it
+   and every `write(ds)` consumes it. As long as both honour that shape, any source
+   composes with any store.
 
-2. **The canonical long frame** `[timestamp, station, variable, value, unit]` is
-   the contract between them. `_parse` promises to produce it; `write` promises
-   to consume it. As long as both honour that shape, any Source composes with any
-   Store.
-
-Because the interaction is that thin, the same Store classes serve a second,
-Source-free purpose — **Store-to-Store conversion**, which is the "reshape a
-master" operation:
-
-```python
-# Read one layout, write another — shape AND format change in one step.
-ds = OneCsvPerStation.read("raw/one-csv-per-station")   # → (time, station) Dataset
-SingleNetcdf.write(ds, "out")                           # → out/master.nc
-```
-
-That symmetry — `fetch(format=...)` and Store→Store being the *same* write path —
-is the point of putting shape and format in one abstraction.
-
-### One-picture summary
+Because the interaction is that thin, the same Store classes serve a Source-free
+purpose — **Store-to-Store conversion** — via the identical `change_format` path.
 
 ```
- Vipnet().fetch("Temperatura", "9/9/2022")
+ Vipnet().fetch("Temperatura", "2026-07-20")
         │
-        ├─ plan() ─► 24 Jobs ─► _execute() ─► raw/vipnet/*.json   (cache)
-        │                                    │
+        ├─ plan() ─► 24 Jobs ─► _execute() ─► raw/vipnet/temperatura/*.json  (cache)
         │                                    └─ _accumulate_discovery ─► stations.csv
         │
-        ├─ format is None ─────────────────► {job_key: payload}   (native, unparsed)
-        │
-        └─ format=OneCsvPerStation
-                 │
-                 └─ _parse ─► long frame [timestamp,station,variable,value,unit]
-                                    │
-                                    └─ OneCsvPerStation.write ─► {station}.csv
-                                                                      ▲
-                        Store-to-Store conversion reuses this exact write path
+        └─ returns RawStore
+                 │  .read()                       Store.change_format(raw, dst[, mode="append"])
+                 ▼                                          │
+        _parse(payload, ctx) per file ─► long frame ─► long_to_dataset ─► (time,station) Dataset
+                                                                    │
+                                              + attach_station_metadata (coords)
+                                                                    │
+                                                    dst.write(ds)  ─► master.nc / {station}.csv
 ```
 
 ---
 
-## 6. Where this is going (today's roadmap)
+## 6. From the terminal
 
-The layers above are built and covered by 84 offline tests, but not yet reachable
-from the CLI, and the cron use case isn't implemented. Planned next:
+Everything above is reachable via generic CLI verbs (see [README.md](README.md)):
 
-1. **Live-test** the three sources against real endpoints.
-2. **Wire the CLI** to Source + Store, then delete the old `data_download/` +
-   `translate/` pipeline it still uses.
-3. **Add writers**: variable-per-file layout, `.parquet`, `.zarr`, `.json`.
-4. **Incremental append** in the Store layer (`_merge_existing` + `_split` for
-   partitioned `{year}/{month}/{day}` master directories) — the daily-cron premise.
+```
+AtmosphereData-CL fetch vipnet Temperatura "2026-07-20" --to single-netcdf --dest out
+AtmosphereData-CL fetch vipnet Temperatura "2026-07-21" --to single-netcdf --dest out --append
+AtmosphereData-CL convert single-netcdf out one-csv-per-station out_csv
+AtmosphereData-CL sources    # dmc-api, sinca, vipnet
+AtmosphereData-CL stores     # one-csv-per-station, single-netcdf
+```

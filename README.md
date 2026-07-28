@@ -1,47 +1,137 @@
 # AtmosphereData-CL
 
-Software para descargar productos de datos atmosféricos —redes de observación, salidas de
-modelos, datos satelitales— y transformarlos entre formatos y formas (*shapes*). La interfaz
-de este software es vía línea de comandos, y también puede usarse como librería.
+Software para **descargar productos de datos atmosféricos** —redes de observación
+hoy; modelos y redes de monitoreo. Se usa por línea de comandos o como librería de Python.
 
-## Idea de este proyecto
+Cambiar de formato (`.csv`, `.netcdf`, …) y cambiar de forma (un archivo por estación, un master único, un directorio particionado por fecha).
 
-Crear un software que pueda descargar y procesar automáticamente datos atmosféricos de
-distintas fuentes, y escribirlos en el formato y la forma que se necesite:
-
-- **Formatos**: `.csv`, `.json`, `.netcdf`, y otros a futuro (`.parquet`, `.zarr`). Si los
-  datos ya vienen en el formato deseado, la conversión es una operación nula.
-- **Formas**: un archivo maestro único, un directorio maestro particionado
-  (`año/mes/día.ext`), un archivo por estación, un archivo por variable.
-
-Cambiar de formato y cambiar de forma son la misma operación: leer de un almacén y escribir
-en otro.
-
-La meta es poder ejecutarlo diariamente con `crontab`, extendiendo los archivos maestros de
-manera incremental sin reescribirlos completos.
-
-## Estado actual
-
-Por ahora está implementada la descarga de la red **DMC** (vía su API) y su procesamiento
-desde el formato "intermedio" (data tabulada en formato wide, guardada en `.csv`) al formato
-requerido por Melodies-MONET. El soporte para modelos y satélites, y la abstracción general
-de fuentes y almacenes, están en desarrollo.
-
-La arquitectura acordada está documentada en [AGENTS.md](AGENTS.md).
+La idea es poder tanto crear como extender repositorios de datos, transformar entre formatos y formas, etc. Actualmente enfocado en datos de redes de monitoreo Chilenas como SINCA, DGA (datos de su visualizador VIPNET) y DMC (todas disponibles actualmente).
 
 ## Instalación
 
-Para instalar debe clonar este repositorio y ejecutar dentro de un ambiente virtual
+Clonar el repositorio y, dentro de un entorno virtual:
 
 ```
 pip install -e .
 ```
 
-## Uso
+El comando queda disponible como `AtmosphereData-CL`.
 
-La interfaz de comandos puede ser accedida desde la terminal escribiendo `AtmosphereData-CL`.
-Para obtener más información de su uso ejecute:
+## Fuentes disponibles
+
+Cada fuente es **una forma de acceso**, no una organización. Se listan con
+`AtmosphereData-CL sources`.
+
+| Fuente | Tipo | Auth | Productos / resolución | Notas |
+|---|---|---|---|---|
+| `vipnet` | PointSurface | — | Temperatura, Precipitación, Humedad, Viento, Nieve, Embalse (horario) | Metadatos de estación (lat/lon/nombre) incluidos |
+| `sinca` | PointSurface | — | Contaminantes (O3, PM25, PM10, NO2, …) y meteorológicas; rango libre | lat/lon aún no (sí nombre/región) |
+| `dmc-api` | PointSurface | usuario + token | Red EMA, por estación y mes | Requiere credenciales (ver abajo) |
+
+### Credenciales de DMC
+
+`dmc-api` necesita `usuario` y `token` de meteochile.gob.cl. Se toman de las
+variables de entorno `DMC_API_USER` / `DMC_API_TOKEN` (se carga automáticamente un
+archivo `.env` si existe), o se pasan con `--user` / `--token`.
 
 ```
-AtmosphereData-CL --help
+# .env
+DMC_API_USER=tu_usuario
+DMC_API_TOKEN=tu_token
 ```
+
+## Uso por línea de comandos
+
+```
+AtmosphereData-CL sources        # fuentes registradas
+AtmosphereData-CL stores         # formas/formatos de almacenamiento
+```
+
+### `fetch` — descargar (y opcionalmente componer un master)
+
+```
+AtmosphereData-CL fetch FUENTE PRODUCTO PERIODO [opciones]
+```
+
+`PERIODO` acepta un instante, un mes o un rango:
+`"2024-01"`, `"2026-07-20 12:00"`, `"1/9/2022 to 30/9/2022"`.
+
+Descargar a la *raw store* (que también es la caché — no re-descarga lo ya
+guardado):
+
+```
+AtmosphereData-CL fetch vipnet Temperatura "2026-07-20 12:00"
+```
+
+Descargar y componer un master NetCDF:
+
+```
+AtmosphereData-CL fetch vipnet Temperatura "2026-07-20 12:00" \
+    --to single-netcdf --dest ./salida
+```
+
+Caso de producción (cron) — **crecer** un master existente en vez de sobrescribir:
+
+```
+AtmosphereData-CL fetch vipnet Temperatura "2026-07-20 13:00" \
+    --to single-netcdf --dest ./salida --append
+```
+
+El `--append` es idempotente (re-ejecutar el mismo periodo no duplica) y atómico
+(un corte a mitad de escritura no corrompe el master).
+
+Opciones útiles: `--stations a,b,c`, `--variables x,y`, `--raw-dir DIR`,
+`--extra clave=valor` (opciones específicas de la fuente, p.ej.
+`--extra min_validation_level=preliminar` en SINCA), `--user`/`--token` (dmc-api).
+
+### `convert` — reformatear / reformar un almacén
+
+```
+AtmosphereData-CL convert FORMA_ORIGEN DIR_ORIGEN FORMA_DESTINO DIR_DESTINO [--append]
+```
+
+```
+# de master único a un archivo por estación
+AtmosphereData-CL convert single-netcdf ./salida one-csv-per-station ./por_estacion
+```
+
+## Uso como librería
+
+```python
+from atmosphere_data_cl.sources import Vipnet
+from atmosphere_data_cl.store import SingleNetcdf, Store
+
+# Descargar → devuelve un RawStore (nada se parsea hasta que se lee/convierte)
+raw = Vipnet().fetch("Temperatura", "2026-07-20 12:00")
+
+ds = raw.read()                                   # -> xarray.Dataset (time, station)
+Store.change_format(raw, SingleNetcdf("salida"))          # componer master.nc
+Store.change_format(raw, SingleNetcdf("salida"), mode="append")   # crecerlo
+
+# Leer datos crudos ya en disco, sin red, usando el parser de la fuente:
+from atmosphere_data_cl.store import RawStore
+RawStore(Vipnet, "raw/vipnet").read()
+```
+
+## Formatos y formas (Stores)
+
+Un *Store* es `directorio base` + `plantilla de ruta` + `formato`. La plantilla es
+la forma y el codificador es el formato.
+
+| Store | Forma |
+|---|---|
+| `single-netcdf` | un master `.nc` con todas las estaciones y variables |
+| `one-csv-per-station` | un `.csv` por estación (+ `stations.csv` con metadatos) |
+
+En NetCDF los metadatos de estación (lat/lon/nombre) viajan como coordenadas; en
+los formatos tabulares van en un archivo `stations.csv` aparte.
+
+## Arquitectura
+
+- [AGENTS.md](AGENTS.md) — visión general y decisiones de diseño.
+- [EXPLANATION.md](EXPLANATION.md) — cómo funcionan `Source` y `Store` en detalle, con un ejemplo completo.
+
+## Estado
+
+Implementado: descarga de `vipnet`, `sinca` y `dmc-api`; masters `.nc` y
+`.csv`-por-estación; masters incrementales. 
