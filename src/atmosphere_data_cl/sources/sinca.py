@@ -222,9 +222,14 @@ class Sinca(Source):
             return self._stations
 
         # Scrape the 16 regions concurrently — this is the slowest part of a cold
-        # fetch (16 sequential GETs, ~30 s), and it only runs once per cache.
+        # fetch, and it only runs once per cache.
         per_region = self._map_concurrent(self._scrape_region, list(regions or REGIONES))
         rows = [row for region_rows in per_region for row in region_rows]
+
+        # Coordinates aren't on the region listing — they live on each station's
+        # own page. Enrich concurrently (one GET per station); cheap now that the
+        # driver pools requests, and cached to stations.csv afterwards.
+        rows = self._map_concurrent(self._enrich_station, rows)
 
         stations = pd.DataFrame(rows, columns=STATION_META_COLS)
         self.stations_file.parent.mkdir(parents=True, exist_ok=True)
@@ -268,6 +273,24 @@ class Sinca(Source):
                 "airviro_id": airviro,
             })
         return rows
+
+    def _enrich_station(self, station: dict[str, Any]) -> dict[str, Any]:
+        """Add lat/lon from a station's own page, embedded in a Google Maps call.
+
+        The region listing has no coordinates; each station page carries a
+        ``google.maps.LatLng(lat, lng)`` snippet. A failed fetch leaves the row
+        as-is (lat/lon simply absent) rather than sinking discovery.
+        """
+        try:
+            html = self.client.get(STATION_URL.format(id=station["station_id"]), timeout=30).text
+        except Exception as exc:
+            log.warning("sinca: no station card for %s: %s", station["station_id"], exc)
+            return station
+        match = _LATLNG_RE.search(html)
+        if match:
+            station["latitude"] = float(match.group(1))
+            station["longitude"] = float(match.group(2))
+        return station
 
     def _targets(self, spec: FetchSpec) -> list[dict[str, Any]]:
         stations = self.discover_stations()

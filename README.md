@@ -40,6 +40,39 @@ DMC_API_USER=tu_usuario
 DMC_API_TOKEN=tu_token
 ```
 
+## Sources
+
+Variables disponibles por fuente. En `sinca` y `vipnet` el argumento `PRODUCTO`
+selecciona las variables (una o varias separadas por comas). `dmc-api` **descarga
+y almacena todas sus variables** en cada llamada, así que `PRODUCTO` no filtra.
+
+### sinca
+
+**Contaminantes:** `PM25`, `PM10`, `SO2`, `NO`, `NO2`, `CO`, `O3`, `Cu`, `Pb`,
+`CH4`, `HCM`, `NOx`, `As`, `PM10HV`
+
+**Meteorológicas:** `RAD`, `PRES`, `RAIN`, `RHUM`, `WDIR`, `WSPD`, `TEMP`
+
+Las meteorológicas admiten altura (`--extra heights=002,010`); la altura pasa a
+formar parte del nombre de la variable (p.ej. `WSPD_010`). Nivel de validación con
+`--extra min_validation_level=preliminar` (`validado` por defecto).
+
+### vipnet
+
+`Temperatura`, `Precipitación`, `Humedad`, `Viento`, `Nieve`, `Embalse` (horario).
+
+### dmc-api
+
+Cada descarga trae las ~25 columnas de la estación (las que el sensor reporte);
+las que quedan totalmente vacías se descartan al componer el master. Las más
+comunes:
+
+`temperatura`, `puntoDeRocio`, `temperaturaMaxima12Horas`, `temperaturaMinima12Horas`,
+`humedadRelativa`, `presionEstacion`, `presionNivelDelMar`, `presionNivelEstandar`,
+`direccionDelVientoPromedio10Minutos`, `direccionDelVientoPromedio2Minutos`,
+`fuerzaDelVientoPromedio10Minutos`, `fuerzaDelVientoPromedio2Minutos`,
+`radiacionGlobalInst`, `aguaCaida24Horas`, `aguaCaida6Horas`, `aguaCaidaDelMinuto`.
+
 ## Uso por línea de comandos
 
 ```

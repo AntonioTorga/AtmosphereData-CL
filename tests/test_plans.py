@@ -56,9 +56,19 @@ class TestSincaDiscovery:
         '</tbody></table>'
     )
 
+    # Coordinates live on each station's own page, keyed by id.
+    LATLNG = {"232": (-18.48, -70.30), "157": (-20.27, -70.10)}
+
+    def _handler(self, request):
+        url = str(request.url)
+        if "/estacion/" in url:
+            sid = url.rstrip("/").rsplit("/", 1)[-1]
+            lat, lng = self.LATLNG.get(sid, (-33.0, -70.0))
+            return httpx.Response(200, text=f"<script>google.maps.LatLng({lat}, {lng})</script>")
+        return httpx.Response(200, text=self.REGION_HTML)
+
     def _source(self, tmp_path):
-        handler = lambda request: httpx.Response(200, text=self.REGION_HTML)  # noqa: E731
-        return Sinca(raw_dir=tmp_path, client=httpx.Client(transport=httpx.MockTransport(handler)))
+        return Sinca(raw_dir=tmp_path, client=httpx.Client(transport=httpx.MockTransport(self._handler)))
 
     def test_scrapes_and_assembles_station_table(self, tmp_path):
         s = self._source(tmp_path)
@@ -69,6 +79,19 @@ class TestSincaDiscovery:
         assert set(stations["airviro_id"]) == {"F01", "117"}     # from the macropath links
         assert set(stations["region"]) == {"XV", "I"}            # one row per region scanned
         assert s.stations_file.exists()                          # cached to disk
+
+    def test_enriches_lat_lon_from_station_page(self, tmp_path):
+        """Coordinates come from a second GET per station, not the region listing."""
+        s = self._source(tmp_path)
+        # one region → each station appears once (the fake page lists both)
+        stations = s.discover_stations(regions=["XV"]).set_index("station_id")
+        assert stations.loc["232", "latitude"] == -18.48
+        assert stations.loc["232", "longitude"] == -70.30
+        assert stations.loc["157", "latitude"] == -20.27
+
+        # and they thread through station_metadata() as numeric coords
+        meta = s.station_metadata().set_index("station")
+        assert meta.loc["232", "latitude"] == -18.48
 
     def test_concurrency_one_matches_default(self, tmp_path):
         seq = self._source(tmp_path / "seq")
