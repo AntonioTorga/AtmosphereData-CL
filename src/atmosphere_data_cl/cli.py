@@ -122,14 +122,17 @@ def fetch(
     mode: Annotated[str, typer.Option(help="vipnet aggregation mode.")] = None,
     workers: Annotated[int, typer.Option("--workers",
         help="Concurrent requests in flight (lower for a rate-limiting endpoint).")] = None,
+    no_cache: Annotated[bool, typer.Option("--no-cache",
+        help="Re-download even if the raw file exists. Needed to refresh a still-"
+             "accumulating period (e.g. DMC's current month keeps filling in).")] = False,
     extra: Annotated[list[str], typer.Option("--extra",
         help="Extra fetch option key=value (repeatable), e.g. min_validation_level=preliminar.")] = None,
 ):
     """Download data from a source into the raw store, optionally converting to a master.
 
-    The raw store doubles as the cache: a period already on disk is not refetched.
-    With --to/--dest the raw is converted into the given layout; add --append to
-    grow an existing master (the cron pattern).
+    The raw store doubles as the cache: a period already on disk is not refetched
+    unless you pass --no-cache. With --to/--dest the raw is converted into the given
+    layout; add --append to grow an existing master (the cron pattern).
     """
     if to and not dest:
         raise typer.BadParameter("--to requires --dest")
@@ -145,6 +148,7 @@ def fetch(
         products[0], period,
         stations=_split_csv(stations),
         variables=products,
+        use_cache=not no_cache,
         **extras,
     )
     print(f"[green]fetched[/green] {source}/{','.join(products)} → raw under {raw.base_dir}")

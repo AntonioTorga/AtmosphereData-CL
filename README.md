@@ -116,12 +116,24 @@ AtmosphereData-CL fetch vipnet Temperatura "2026-07-20 13:00" \
 El `--append` es idempotente (re-ejecutar el mismo periodo no duplica) y atómico
 (un corte a mitad de escritura no corrompe el master).
 
+**Periodos que aún se están llenando** (el mes/día en curso, típico en DMC cuyo
+endpoint entrega datos "recientes"): la raw store no re-descarga lo ya guardado, así
+que hay que forzar con `--no-cache` para traer las horas nuevas antes de `--append`:
+
+```
+AtmosphereData-CL fetch dmc-api dmc "2024-01" --no-cache \
+    --to single-netcdf --dest ./salida --append
+```
+
+Para periodos ya cerrados (un mes pasado) omite `--no-cache` y aprovecha la caché.
+
 `PRODUCTO` acepta una variable o una lista separada por comas (`O3,NO2,PM10`), que
 se descargan en la misma llamada.
 
-Opciones útiles: `--stations a,b,c`, `--raw-dir DIR`, `--extra clave=valor`
-(opciones específicas de la fuente, p.ej. `--extra min_validation_level=preliminar`
-en SINCA), `--user`/`--token` (dmc-api).
+Opciones útiles: `--stations a,b,c`, `--raw-dir DIR`, `--no-cache` (re-descargar),
+`--workers N` (concurrencia), `--extra clave=valor` (opciones específicas de la
+fuente, p.ej. `--extra min_validation_level=preliminar` en SINCA),
+`--user`/`--token` (dmc-api).
 
 ### `convert` — reformatear / reformar un almacén
 
